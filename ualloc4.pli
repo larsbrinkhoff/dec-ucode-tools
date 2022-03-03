@@ -1,0 +1,814 @@
+alloc4 : proc options(main);
+
+%REPLACE compile_date BY '13-Jul-82 RLS';
+
+/*
+
+	Pass 4 of the V-11 microcode address allocator. This pass reads 
+	in a .U40 file, prints its linking constituents, and 
+	error-checks for duplicate words.
+
+	Written by Richard L. Sites July, 1982
+
+*/
+
+/* CHANGE HISTORY:
+
+*/
+
+/*
+	         10        20        30        40        50        60        70
+	123456789.123456789.123456789.123456789.123456789.123456789.123456789.
+(1)	; <<< ALLOCATED 06-Jul-82 23:14:55
+(2)	;     ALLOCATED 06-Jul-82 23:14:55 >>>
+(3)	;= GBL 104B EXTZV..
+(3)	;= EXT 0008 CMPV..foo
+(4)	;    LINK1.ULD               MICRO2  1M(01)     6-JUL-82  16:57:45
+(5)	[15B4]=B46380A053
+(5)	[15B4]I=F0F0B46380A053
+(5)	[7FFF]=0007061810
+*/
+
+
+%replace false by '0'b;
+%replace true  by '1'b;
+
+%REPLACE max_files	BY 5;
+%REPLACE push_ts_col	BY 17;
+%REPLACE ext_col	BY 4;
+%REPLACE extaddr_col	BY 8;
+%REPLACE extname_col	BY 13;
+%REPLACE file_col	BY 2;
+%REPLACE date_col 	BY 48;
+%REPLACE time_col	BY 59;
+%REPLACE codeaddr_col	BY 2;
+%REPLACE memory_col	BY 7;
+
+%replace unknown by -3;
+%replace extrn   by -2;
+%replace addr_zero by -1;
+
+%REPLACE max_addr		BY 32767;
+
+%REPLACE from_lower	BY 'abcdefghijklmnopqrstuvwxyz';
+%REPLACE to_upper	BY 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+
+DCL curr_col FIXED BIN(31);
+DCL (flag_verbose,flag_xref) BIT(1) ALIGNED;
+DCL file_name(0:max_files)	CHAR(13);
+DCL micro2_ts(0:max_files)	CHAR(18);
+DCL alloc_ts(0:max_files)	CHAR(18);
+
+DCL global_seen(0:max_addr) BIT(1);	/* set if Global for a0000 */
+DCL is_ext     (0:max_addr) BIT(1);	/* set if Ext    for m0000 */
+
+DCL code_count(0:max_files,0:25) FIXED BIN(31);
+
+dcl hash_anchor(0:1023) ptr;
+
+DCL code_anchors(0:max_addr) PTR;
+
+DCL gbl_anchor PTR;
+
+DCL file_number		FIXED BIN(31);
+DCL max_file_seen	FIXED BIN(31);
+
+DCL 1 code_node BASED,
+	2 link PTR,
+	2 file_no FIXED BIN(7),
+	2 mem CHAR(1),
+	2 code_text CHAR(10);
+
+DCL 1 root_node BASED,
+	2 link PTR,
+	2 suffix_link PTR,
+	2 root_name CHAR(30) VAR;
+
+DCL 1 suffix_node BASED,
+	2 link PTR,
+	2 addr FIXED BIN(15),
+	2 file_no FIXED BIN(15),
+	2 suffix_name CHAR(30) VAR;
+
+
+DCL hex_table(0:15) char(1) initial('0','1','2','3','4','5','6',
+	'7','8','9','A','B','C','D','E','F') STATIC READONLY;
+
+dcl	debug		char(30) var;	/* debugging options	*/
+dcl	buf		char(255) var;	/* input text line */
+
+dcl	current_umem	char(1);	/* extracted micro memory */
+dcl	current_uaddr	fixed bin(31);	/* extracted micro address */
+dcl	current_ubits	bit(128) ALIGNED;	/* extracted micro instruction,
+					    left justified */
+
+dcl	1 buf_window,			/* part before possible FF */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+
+dcl null builtin;
+dcl (uldfile) file;
+dcl (uldname) char(80) var;
+dcl eof bit(1) ALIGNED;
+dcl (tab,ff) char(1);
+
+dcl 1 cons based,
+	2 car ptr,
+	2 cdr ptr;
+
+dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+
+hashval : proc(n) returns(fixed bin(31));
+	/* hash name n. heavy weight on first char<3:0>, last char<3:0> */
+	/*  length<1:0>. result in range 0..1023 */
+	dcl n char(30) var;
+	dcl i fixed bin(31);
+
+	i = length(n);
+	if i>0 then
+		i = mod( rank(substr(n,1,1))*65 +
+			rank(substr(n,i,1))*4 + i, 1024 );
+	return(i);
+end; /* hashval */
+
+
+symtable : proc(n,is_new) returns(ptr);
+	/* looks up name n in symtab. if not found, inserts it. */
+	/* returns is_new=true if inserted */
+	dcl n char(30) var;
+	dcl is_new bit(1) ALIGNED;
+	dcl i fixed bin(31), p ptr;
+
+	i = hashval(n);
+	p = hash_anchor(i);
+	do while( (p^=null) & (p->root_node.root_name^=n) );
+		p = p->root_node.link; end;
+	is_new = (p=null);
+	if p=null then
+	    do; /* insert new entry */
+		allocate root_node set(p);
+		CALL enqueue(gbl_anchor,p);
+		p->root_node.link	= hash_anchor(i);
+		p->root_node.root_name		= n;
+		p->root_node.suffix_link	= null;
+		hash_anchor(i) = p;
+	    end; /* insert new entry */
+	return(p);
+end; /* symtable */
+
+
+sort_list : PROC(p) RETURNS(PTR);
+	/* sort a single-linked list. insertion sort */
+	/* lists are expected to be short */
+	DCL p PTR;
+	DCL q PTR;
+	DCL sorted_p PTR;
+	DCL (walk_p,walk_s) PTR;
+	DCL (walk_sorted_p,walk_sorted_s,old_walk_p) PTR;
+
+	sorted_p = NULL;
+	walk_p = p;
+	/* take each thing off p and put it on sorted_p */
+	DO WHILE(walk_p^=NULL);
+		walk_s = walk_p -> cons.car;
+		q = walk_p -> cons.cdr;
+		walk_sorted_p = sorted_p;
+		old_walk_p = NULL;
+		DO WHILE(walk_sorted_p^=NULL);
+			walk_sorted_s = walk_sorted_p -> cons.car;
+			IF walk_s->root_node.root_name <=
+				walk_sorted_s->root_node.root_name THEN
+				GOTO fall_out;
+			old_walk_p = walk_sorted_p;
+			walk_sorted_p = walk_sorted_p -> cons.cdr;
+		END; /* walk_sorted_p */
+fall_out:
+		/* put walk_p AFTER old_walk_p */
+		IF old_walk_p = NULL THEN
+		    DO;
+			walk_p -> cons.cdr = sorted_p;
+			sorted_p = walk_p;
+		    END;
+		ELSE DO;
+			walk_p -> cons.cdr = old_walk_p -> cons.cdr;
+			old_walk_p -> cons.cdr = walk_p;
+		    END;
+		walk_p = q;
+	END; /* walk_p */	
+	RETURN(sorted_p);
+END sort_list;
+
+
+enqueue : proc(anchor,p);
+	/* add p to linked list anchor */
+	dcl (anchor,p) ptr;
+	dcl q ptr;
+
+	allocate cons set(q);
+	q->cons.car = p;
+	q->cons.cdr = anchor;
+	anchor = q;
+end; /* enqueue */
+
+
+hex_mcr_time_stamp : PROC RETURNS(CHAR(10));
+	/* convert MCR time stamp to 00mmddhhmm */
+	DCL c10 CHAR(10);
+	DCL i FIXED BIN(31);
+	DCL mcr_time_stamp CHAR(18);
+
+/*	
+mcr_time_stamp:
+" 3-APR-82 21:06:50"
+ 123456789.123456789.
+*/
+	c10 = '0000000000';
+	i = INDEX('JANFEBMARAPRMAYJUNJULAUGSEPOCTNOVDEC',
+		SUBSTR(mcr_time_stamp,4,3));
+	i = DIVIDE(i-1,3,31,0)+1;			/* 1-12 */
+	SUBSTR(c10,3,1) = BYTE( DIVIDE(i,10,31,0) + RANK('0') );
+	SUBSTR(c10,4,1) = BYTE( MOD(i,10)         + RANK('0') );
+	SUBSTR(c10,5,2) = SUBSTR(mcr_time_stamp,1,2);
+	SUBSTR(c10,7,2) = SUBSTR(mcr_time_stamp,11,2);
+	SUBSTR(c10,9,2) = SUBSTR(mcr_time_stamp,14,2);
+	IF SUBSTR(c10,5,1)=' ' THEN
+		SUBSTR(c10,5,1) = '0';
+	IF SUBSTR(c10,7,1)=' ' THEN
+		SUBSTR(c10,7,1) = '0';
+	RETURN(c10);
+END hex_mcr_time_stamp;
+
+
+epilogue : proc;
+
+put skip edit ('Closing file ',uldname) (a,a);
+close file(uldfile);
+end; /* epilogue */
+
+
+untab : proc(s);
+	/* Replaces tabs in string s with blanks. Tab = cols 8n+1 */
+	dcl s char(255) var;
+	dcl (i,j) fixed bin(31);
+
+	i = index(s,tab);
+	do while (i>0);
+		s = substr(s,1,i-1) ||
+			substr('        ',1,mod(8-i,8)+1) ||
+			substr(s,i+1);
+		i = index(s,tab);
+	end; /* do while */
+end; /* untab */
+
+
+
+GET_FILE_AND_DEBUG: PROCEDURE;
+%include $stsdef;
+declare lib$get_foreign external entry(char(*)) options(variable) returns(fixed binary(31));
+declare (input_BUFFER) character(132);
+DECLARE (POINT_START,BUFF_START,POINT_END) FIXED BINARY(31);
+
+
+INPUT_BUFFER=' ';
+
+sts$value=lib$get_foreign(input_BUFFER);
+
+INPUT_BUFFER = translate(INPUT_BUFFER,to_upper,from_lower);
+
+POINT_START=VERIFY(INPUT_BUFFER,' ');
+
+IF POINT_START^= 0 THEN DO;
+	POINT_END = INDEX(SUBSTR(INPUT_BUFFER,POINT_START,132-POINT_START),' ');
+	uldname=SUBSTR(INPUT_BUFFER,POINT_START,POINT_END-POINT_START);
+
+	BUFF_START=INDEX(INPUT_BUFFER,'/DEBUG=');
+	IF BUFF_START=0 THEN
+		DEBUG='';
+	ELSE 
+		DEBUG = SUBSTR(INPUT_BUFFER,BUFF_START+7,INDEX(SUBSTR(INPUT_BUFFER,BUFF_START+7),' ')-1);
+
+
+END;
+
+ELSE DO;
+	PUT SKIP LIST('INPUT FILE <.U40>: ');
+	GET LIST(uldname);
+
+
+	/* ---------- OPTIONS ------------------------------------------------------- */
+	put skip edit('V(erbose X(ref ') (A);
+	put skip edit('Debugging options: ') (a);
+	get list(debug); 
+
+END;
+
+put skip edit('Debugging options: ') (a);		
+debug = translate(debug,to_upper,from_lower);
+put skip list(debug);
+
+flag_verbose = INDEX(debug,'V')^=0;
+flag_xref    = INDEX(debug,'X')^=0;
+
+END get_file_and_debug;
+
+
+
+prologue : proc;
+dcl i fixed bin(31);
+dcl tt char(8);
+dcl months(1:12) char(3) static readonly initial(
+	'Jan','Feb','Mar','Apr','May','Jun',
+	'Jul','Aug','Sep','Oct','Nov','Dec');
+
+put skip list ('ADDRESS ALLOCATOR, PASS 4. '||compile_date);
+
+call GET_FILE_AND_DEBUG;
+
+uldname = uldname ||'.U40';
+
+put skip edit ('Opening file ',uldname) (a,a);
+open file(uldfile) stream input title(uldname);
+put skip;
+
+tab = byte(9);
+ff = byte(12);
+
+global_seen = false;
+is_ext = false;
+
+gbl_anchor = null;
+hash_anchor = null; 
+code_anchors = null;
+code_count = 0;
+
+file_number = 0;
+max_file_seen = 0;
+file_name = '';
+micro2_ts = '';
+alloc_ts  = '';
+
+end; /* prologue */
+
+
+get_hex4 : PROC(c4) RETURNS(FIXED BIN(31));
+	/* Converts 4 hex chars to integer */
+	DCL c4 CHAR(4);
+	DCL n FIXED BIN(31);
+	DCL (i,j) FIXED BIN(31);
+	DCL c CHAR(1);
+
+	n = 0;
+	DO i= 1 TO 4;
+		c = SUBSTR(c4,i,1);
+		IF      '0'<=c & c<='9' THEN n = n*16 + RANK(c)-RANK('0');
+		ELSE IF 'A'<=c & c<='F' THEN N = N*16 + RANK(c)-RANK('A')+10;
+		ELSE IF 'a'<=c & c<='f' THEN N = N*16 + RANK(c)-RANK('a')+10;
+	END;
+	RETURN(n);
+END get_hex4;
+
+put_hex4 : PROC(n) RETURNS(CHAR(4));
+	/* Converts integer to 4 hex chars */
+	DCL c4 CHAR(4);
+	DCL n FIXED BIN(31);
+	DCL (i,k) FIXED BIN(31);
+
+	k = n;
+	DO i= 4 TO 1 BY -1;
+		SUBSTR(c4,i,1) = hex_table(MOD(k,16));
+		k = DIVIDE(k,16,31,0);
+	END;
+	RETURN(c4);
+END put_hex4;
+
+
+reverse : proc(anch);
+	/* reverse single-linked cdr list */
+	dcl anch ptr;
+	dcl (p,q,r) ptr;
+
+	q = null;
+	p = anch;
+	do while(p^=null);
+		r = p;			/* r = elem to change    */
+		p = p->cons.cdr;	/* p = unchanged sublist */
+		r->cons.cdr = q;	/* q = reversed sublist  */
+		q = r;
+	end;
+	anch = q;
+end; /* reverse */
+
+
+enter_name : PROC( is_ext, addr, name);
+	DCL is_ext BIT(1) ALIGNED;
+	DCL addr FIXED BIN(31);
+	DCL name CHAR(31) VAR;
+	DCL (p,q) PTR;
+	DCL (root,suffix) CHAR(30) VAR;
+	DCL i FIXED BIN(31);
+	DCL is_new BIT(1) ALIGNED;
+
+	i = MAX( INDEX(name,'..'), INDEX(name,'__') );
+	root = SUBSTR(name,1,i+1);	/* foo.. */
+	suffix = SUBSTR(name,i+2);	/* baz */
+
+	p = symtable(root,is_new);
+
+	ALLOCATE suffix_node SET(q);
+	q -> suffix_node.addr = addr;
+	q -> suffix_node.file_no = file_number;
+	q -> suffix_node.suffix_name = suffix;
+	q -> suffix_node.link = p -> root_node.suffix_link;
+	p -> root_node.suffix_link = q;
+
+END enter_name;
+
+
+enter_code : PROC(addr, mem, text);
+	DCL addr FIXED BIN(31);
+	DCL mem CHAR(1);
+	DCL text CHAR(31) VAR;
+	DCL c CHAR(1), i FIXED BIN(31);
+	DCL p PTR;
+
+	IF mem='=' THEN c = 'U';
+		   ELSE c = mem;
+	i = RANK(c)-RANK('A');
+	code_count(file_number,i) = code_count(file_number,i) + 1;
+
+	ALLOCATE code_node SET(p);
+	p -> code_node.file_no = file_number;
+	p -> code_node.mem = c;
+	p -> code_node.code_text = text;
+	p -> code_node.link = code_anchors(addr);
+	code_anchors(addr) = p;
+
+END enter_code;
+
+
+process_push : PROC;
+	/* increment file # and extract date/time */
+	file_number = file_number + 1;
+	max_file_seen = MAX(max_file_seen,file_number);
+	buf = TRANSLATE(buf,to_upper,from_lower);
+	alloc_ts(file_number) = SUBSTR(buf,push_ts_col,18);
+	IF SUBSTR(alloc_ts(file_number),1,1)='0' THEN
+		SUBSTR(alloc_ts(file_number),1,1) = ' ';
+END process_push;
+
+
+process_pop : PROC;
+	/* decrement file number */
+	file_number = file_number - 1;
+END process_pop;
+
+
+process_gbl_ext : PROC;
+	/* extract gbl/ext, address, and name */
+	CALL enter_name( SUBSTR(buf,ext_col,3)='EXT', 
+		get_hex4(SUBSTR(buf,extaddr_col,4)), 
+		SUBSTR(buf,extname_col) );
+END process_gbl_ext;
+
+
+process_heading : PROC;
+	/* extract file name and timestamp */
+	buf = TRANSLATE(buf,to_upper,from_lower);
+	CALL untab(buf);
+	file_name(file_number) = SUBSTR(buf,file_col,13);
+	micro2_ts(file_number) = SUBSTR(buf,date_col,10) || 
+		SUBSTR(buf,time_col,8);
+	IF SUBSTR(micro2_ts(file_number),1,1)='0' THEN
+		SUBSTR(micro2_ts(file_number),1,1) = ' ';
+END process_heading;
+
+
+process_code : PROC;
+	/* extract address, memory, and data */
+	CALL enter_code( get_hex4(SUBSTR(buf,codeaddr_col,4)), 
+		SUBSTR(buf,memory_col,1), SUBSTR(buf,INDEX(buf,'=')+1) );
+END process_code;
+
+
+process_one_line : PROC;
+	/* take one U40 line and extract info */
+
+	IF INDEX(buf,'<<<')^=0 THEN
+		CALL process_push;
+	ELSE IF INDEX(buf,'>>>')^=0 THEN
+		CALL process_pop;
+	ELSE IF INDEX(buf,';=')=1 THEN
+		CALL process_gbl_ext;
+	ELSE IF INDEX(buf,'MICRO2')^=0 THEN
+		CALL process_heading;
+	ELSE IF INDEX(buf,'[')=1 THEN
+		CALL process_code;
+
+
+END process_one_line;
+
+
+sum : PROC(j) RETURNS( FIXED BIN(31) );
+	/* Returns sum of code_count(*,j) */
+	DCL (i,j,s) FIXED BIN(31);
+
+	s = 0;
+	DO i=1 TO max_file_seen; s = s + code_count(i,j); END;
+	RETURN(s);
+END sum;
+
+
+calc_e_dupl : PROC(p,has_dupl);
+	/* scan suffix_list for duplicates */
+	/* if not verbose, ignore all EXT entries */
+	DCL (p,q) PTR;
+	DCL (has_dupl,has_one) BIT(1) ALIGNED;
+	DCL c FIXED BIN(31);
+
+	has_one  = '0'B;
+	has_dupl = '0'B;
+	q = p -> root_node.suffix_link;
+	DO WHILE( q^=NULL );
+		IF flag_verbose | q->suffix_node.suffix_name='' THEN
+		IF SUBSTR(has_one,1,1) THEN
+			SUBSTR(has_dupl,1,1) = true;
+		ELSE
+			SUBSTR(has_one,1,1) = true;
+		q = q -> suffix_node.link;
+	END; /* do q */
+END calc_e_dupl;
+
+
+print_e_dupl : PROC(p);
+	/* print duplicates from ext/gbl lists */
+	DCL (p,q) PTR;
+
+	q = p -> root_node.suffix_link;
+	DO WHILE( q^=NULL );
+		PUT EDIT('File ', q->suffix_node.file_no,
+			'[', put_hex4(BINARY(q->suffix_node.addr,31)), ']',
+			p->root_node.root_name || q->suffix_node.suffix_name)
+			(A,F(2),X(1),A,A,A,X(1),A);
+		PUT SKIP;
+		q = q -> suffix_node.link;
+	PUT SKIP;
+	END; /* do q */
+
+END print_e_dupl;
+
+
+calc_e_unres : PROC(p,has_unres);
+	/* scan suffix_list for duplicates */
+	/* if not verbose, ignore all EXT entries */
+	DCL (p,q) PTR;
+	DCL (has_unres,has_one) BIT(1) ALIGNED;
+	DCL c FIXED BIN(31);
+
+	has_unres = true;
+	q = p -> root_node.suffix_link;
+	DO WHILE( q^=NULL );
+		IF q -> suffix_node.suffix_name='' THEN
+			has_unres = false;
+		q = q -> suffix_node.link;
+	END; /* do q */
+END calc_e_unres;
+
+
+print_e_unres : PROC(p);
+	/* print duplicates from ext/gbl lists */
+	DCL (p,q) PTR;
+	DCL i FIXED BIN(31);
+
+	i = LENGTH(p->root_node.root_name) + 3;
+	IF curr_col+i > 80 THEN
+		DO; PUT SKIP; curr_col = 1; END;
+	curr_col = curr_col + i;
+	PUT EDIT(p->root_node.root_name || '   ') (A);
+
+END print_e_unres;
+
+
+print_ext_gbl : PROC;
+	/* complain about duplicates, do xref */
+	DCL (p,q) PTR;
+	DCL has_dupl BIT(1) ALIGNED;
+
+	put skip;
+	put list('Duplicate globals');
+	put skip;
+	put list('-----------------');
+	put skip;
+
+	p = gbl_anchor;
+	DO WHILE( p^=NULL );
+		q = p -> cons.car;
+		CALL calc_e_dupl(q,has_dupl);
+		IF has_dupl THEN
+			CALL print_e_dupl(q);
+		p = p -> cons.cdr;
+	END; /* do p */
+END print_ext_gbl;
+
+
+print_xref : PROC;
+	/* complain about duplicates, do xref */
+	DCL (p,q) PTR;
+	DCL has_unres BIT(1) ALIGNED;
+
+	put skip;
+	put list('Unresolved externals');
+	put skip;
+	put list('--------------------');
+	put skip;
+
+	curr_col = 1;
+	p = gbl_anchor;
+	DO WHILE( p^=NULL );
+		q = p -> cons.car;
+		CALL calc_e_unres(q,has_unres);
+		IF has_unres THEN
+			CALL print_e_unres(q);
+		p = p -> cons.cdr;
+	END; /* do p */
+	put skip;
+
+	put skip;
+	put list('Resolved globals');
+	put skip;
+	put list('----------------');
+	put skip;
+
+	curr_col = 1;
+	p = gbl_anchor;
+	DO WHILE( p^=NULL );
+		q = p -> cons.car;
+		CALL calc_e_unres(q,has_unres);
+		IF ^has_unres THEN
+			CALL print_e_unres(q);
+		p = p -> cons.cdr;
+	END; /* do p */
+	put skip;
+END print_xref;
+
+
+calc_dupl : PROC(p,has_dupl);
+	/* set 26-bit vector of duplicate entries at this address */
+	/* if not verbose, ignore all HALT instructions */
+	DCL (p,q) PTR;
+	DCL (has_dupl,has_one) BIT(26) ALIGNED;
+	DCL c FIXED BIN(31);
+
+	has_one  = '0'B;
+	has_dupl = '0'B;
+	q = p;
+	DO WHILE( q^=NULL );
+		c = RANK(q -> code_node.mem) - RANK('A') + 1;
+		IF flag_verbose |
+			(SUBSTR(q->code_node.code_text,1,3)^='FFF' &
+			 SUBSTR(q->code_node.code_text,1,3)^='7FF') THEN
+		IF SUBSTR(has_one,c,1) THEN
+			SUBSTR(has_dupl,c,1) = true;
+		ELSE
+			SUBSTR(has_one,c,1) = true;
+		q = q -> code_node.link;
+	END; /* do q */
+END calc_dupl;
+
+print_dupl_a : PROC(n,p,i);
+	/* print all duplicates from memory i */
+	DCL (p,q) PTR;
+	DCL (n,i,c) FIXED BIN(31);
+
+	q = p;
+	DO WHILE( q^=NULL );
+		c = RANK(q -> code_node.mem) - RANK('A') + 1;
+		IF c=i THEN
+		PUT EDIT('File ', q->code_node.file_no, '[', put_hex4(n), ']',
+			q->code_node.mem, q->code_node.code_text)
+			(A,F(2),X(1),A,A,A,A,X(1),A);
+		PUT SKIP;
+		q = q -> code_node.link;
+	END; /* do q */
+	PUT SKIP;
+END print_dupl_a;
+
+print_dupl : PROC(n,p,has_dupl);
+	/* print all duplicates from each memory in has_dupl vector */
+	/* changes has_dupl */
+	DCL p PTR;
+	DCL has_dupl BIT(26) ALIGNED;
+	DCL (n,i) FIXED BIN(31);
+
+	i = INDEX(has_dupl,true);
+	DO WHILE( i^=0 );
+		SUBSTR(has_dupl,i,1) = false;
+		CALL print_dupl_a(n,p,i);
+		i = INDEX(has_dupl,true);
+	END; /* do i */
+END print_dupl;
+
+
+print_code : PROC;
+	/* complain about duplicates */
+	DCL i FIXED BIN(31);
+	DCL p PTR;
+	DCL has_dupl BIT(26) ALIGNED;
+
+	put skip;
+	put list('Duplicate microinstructions');
+	put skip;
+	put list('---------------------------');
+	put skip;
+
+	DO i=0 TO max_addr-16;	/* IGNORE TIME STAMP @ 7FF0 */
+	    p = code_anchors(i);
+	    IF p^=NULL THEN
+		IF p -> code_node.link ^= NULL THEN
+		    DO;	/* at least 2 entries */
+			CALL calc_dupl(p,has_dupl);
+			IF has_dupl ^= '0'B THEN
+				CALL print_dupl(i,p,has_dupl);
+		    END;
+	END; /* do i */
+
+END print_code;
+
+
+print_summary : PROC;
+	/* print out summary of .U40 file */
+	DCL (i,j,k) FIXED BIN(31);
+	DCL c CHAR(1);
+
+	PUT EDIT('File #') (A(8));
+	DO i=1 to max_file_seen;
+		PUT EDIT(i,'') (F(8),A(8));
+ 	END;
+	PUT SKIP;
+
+	PUT EDIT('Name') (A(8));
+	DO i=1 to max_file_seen;
+		PUT EDIT(file_name(i),'') (A(15),A(1));
+	END;
+	PUT SKIP;
+
+	PUT EDIT('Micro2') (A(8));
+	DO i=1 to max_file_seen;
+		PUT EDIT(micro2_ts(i),'') (A(15),A(1));
+	END;
+	PUT SKIP;
+
+	PUT EDIT('Alloc') (A(8));
+	DO i=1 to max_file_seen;
+		PUT EDIT(alloc_ts(i),'') (A(15),A(1));
+	END;
+	PUT SKIP;
+
+	DO j = 0 TO 25;
+		IF SUM(j)>0 THEN
+		    DO;
+			PUT EDIT( BYTE(RANK('A')+j)||'CODE', '' )
+				(A(5),A(3));
+			DO i=1 to max_file_seen;
+				PUT EDIT(code_count(i,j),'') (F(12),A(4));
+			END;
+			PUT SKIP;
+		    END;
+	END; /* do j */
+
+	PUT SKIP;
+
+END print_summary;
+
+
+/*************************************/
+/************ main program ***********/
+/*************************************/
+
+CALL prologue;
+
+eof = false;
+ON ENDFILE(uldfile) eof = true;
+
+GET FILE(uldfile) EDIT(buf) (A(132));
+DO WHILE (^eof);
+	CALL process_one_line; 
+	GET FILE(uldfile) EDIT(buf) (A(132));
+END; /* do while */
+
+CALL print_summary;
+
+gbl_anchor = sort_list(gbl_anchor);
+
+IF flag_xref THEN
+	CALL print_xref;
+
+CALL print_ext_gbl;
+
+CALL print_code;
+
+call epilogue;
+
+end; /* alloc4 */

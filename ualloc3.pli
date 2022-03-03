@@ -1,0 +1,2793 @@
+alloc3 : proc options(main);
+
+%REPLACE compile_date BY '8-Jul-82 TT,RLS';
+
+/*
+
+	Pass 3 of the V-11 microcode address allocator. This pass reads 
+	in (1) old .MCR file, (2) old .ULD file, and (3) .BDR new 
+	allocation file from ALLOC2, and produces new .ACR and .U40 
+	files. Optional input is an old .U40 file of previous microcode 
+	(to be linked on top of).
+
+	Originally written by Tony Troppito, November , 1981.
+	Modified by Richard L. Sites April, 1982
+
+*/
+
+/* CHANGE HISTORY:
+
+ 8-Jul-82  RLS  Put timestamp at 7FF0, since ALLOC2 can't handle 7FFF
+ 7-Jul-82  RLS  Untab micro-2 header lines in ULD files
+ 6-Jul-82  RLS  Finish adding linker. Delete Field/Address stuff from U40
+ 4-Jul-82  RLS  Add linker facility
+ 4-Jul-82  RLS  Change input ".ADR" file to ".BDR" to avoid rewrite if Alloc2 dies.
+ 4-Jul-82  RLS  Add spacing in cheap xref
+10-Jun-82  RLS  Only print first 20 "Identity mapping" messages
+09-Jun-82  RLS  Change column of timestamp in .ULD file
+20-Apr-82  RLS  Ignore fixedoverflow
+15-Apr-82  RLS  Speed up parity calculation
+14-Apr-82  RLS  Major revision of patterns and u_action and bit()
+14-Apr-82  RLS  Reverse order of stack on line 3 of heading
+08-Apr-82  RLS  Put large arrays at one end of declarations
+08-Apr-82  RLS  Make all bit strings aligned
+07-Apr-82  RLS  Change output file from xxx40.ULD to xxx.U40
+06-Apr-82  RLS  Put in quiet message for Jeff
+06-Apr-82  RLS  Put in stack printout.
+06-Apr-82  RLS  Put in xref
+06-Apr-82  RLS  Put in squeezed output
+05-Apr-82  RLS  Fix Offset out of range msg.
+05-Apr-82  RLS  Fix extra char in heading1 line.
+03-Apr-82  RLS  Major re-write
+03-Apr-82  RLS  Remove "Bad Page#, Bad line#" messages
+03-Apr-82  RLS  Compare timestamps.
+03-Apr-82  RLS  Remove many unused subroutines
+03-Apr-82  RLS  Remove = from microword length check
+03-Apr-82  RLS  Remove logic to put begin/end in ULD. Too hard.
+
+*/
+
+%replace false by '0'b;
+%replace true  by '1'b;
+
+%replace lbl_from by 1;
+%replace lbl_to   by 2;
+
+/*
+;      TST.ULD		     MICRO2  1M(01)    10-JUN-82  14:38:01
+;      TST.ULD               MICRO2  1M(01)     9-JUN-82  22:16:13
+ xxxxxxxxx		     x		       x          x
+123456789.123456789.123456789.123456789.123456789.123456789.
+         10        20        30        40        50        60
+*/
+%replace uld_file_col	by 2;
+%replace uld_micro_col	by 30;
+%replace uld_date_col	by 48;
+%replace uld_time_col	by 59;
+
+%replace adr_date_col	by 3;
+%replace ext_date_col	by 3;
+
+%replace h1_file_col 	by 1;		/* heading line columns	*/
+%replace h1_text_col	by 29;		/* ZERO-origin !	*/
+%replace h1_date_col	by 47;
+%replace h1_time_col	by 58;
+%replace h1_page_col	by 123;		/* "Page"		*/
+%replace h1_pageno_col	by 127;
+%replace h2_file_col	by 1;
+%replace h2_text_col	by 29;
+
+%replace h1_file_len	by 28;		/* heading line lengths	*/
+%replace h1_text_len	by 18;		/* ONE-origin (true len)*/
+%replace h1_date_len	by 9;
+%replace h1_time_len	by 8;
+%replace h1_page_len	by 4;
+%replace h1_pageno_len	by 5;
+%replace h2_file_len	by 28;
+%replace h2_text_len	by 103;
+
+%replace unknown by -3;
+%replace extrn   by -2;
+%replace addr_zero by -1;
+
+
+%REPLACE max_addr		BY 32767;
+
+%REPLACE br_off_start		BY 34;
+%REPLACE br_off_len		BY  7;
+%REPLACE jump_disp_start	BY 29;
+%REPLACE jump_disp_len		BY 12;
+%REPLACE page_no_start		BY 20;
+%REPLACE page_no_len		BY  3;
+
+
+%replace next_uinst	by '_NEXT_UINST_';
+
+%replace t_name 	by 1;		/* must be first */
+%replace t_numb 	by 2;
+%replace t_lpar 	by 3;
+%replace t_rpar 	by 4;
+%replace t_plusm 	by 5;
+%replace t_comma 	by 6;
+%replace t_eoln 	by 7;
+%replace t_other 	by 8;		/* must be last */
+
+
+%REPLACE odd_parity	BY  1;	/* default parity is odd */
+%REPLACE calc_parity	BY  1;	/* default is to calculate parity */
+%REPLACE begin_name_size BY 7;  /* number of char of begin label to print */
+
+
+DCL 1 adr (0:max_addr),			/* subscript by m0000 or a0000 */
+		2 line    fixed bin,	/* for m0000 */
+		2 page    fixed bin,	/* for a0000 */
+		2 new     fixed bin; 	/* for m0000 */
+
+DCL global_seen(0:max_addr) BIT(1);	/* set if Global for a0000 */
+DCL is_ext     (0:max_addr) BIT(1);	/* set if Ext    for m0000 */
+
+dcl hash_anchor(0:1023) ptr;
+
+dcl 1 field(0:99), 2 start fixed bin(31), 2 len fixed bin(31);
+
+dcl token_type_tbl(0:255) fixed bin(31);
+
+DCL byte_parity(0:255) FIXED BIN(7);
+
+
+DCL hex_table(0:15) char(1) initial('0','1','2','3','4','5','6',
+	'7','8','9','A','B','C','D','E','F') STATIC READONLY;
+
+DCL	uld_next	FIXED BIN(31);
+DCL	source_add	FIXED BIN(31);
+DCL	u40_lineno	FIXED BIN(31);
+DCL	page_true_char	CHAR(5);
+DCL	page_false_char	CHAR(5);
+DCL	target_add_char	CHAR(4);
+DCL	false_add_char	CHAR(4);
+DCL	use_address	BIT(1) ALIGNED;  	/* use the address in the parity calculation */
+DCL	float_flag	BIT(1) ALIGNED;
+DCL	false_label	BIT(1) ALIGNED;
+DCL	true_label	BIT(1) ALIGNED;
+DCL	write_stack	BIT(1) ALIGNED;		/* to write the stack or not to write the stack */
+DCL	do_stacking	BIT(1) ALIGNED;		/* stacking is done for .BIN lines only */
+DCL	use_parity	BIT(1) ALIGNED;		/* to calculate parity or not to calculate parity */
+DCL	parity_type	BIT(1) ALIGNED;		/* The parity polarity to use */
+DCL	process_uld	BIT(1) ALIGNED;		/* currently processing the uld file */
+DCL	memories INITIAL('Uu') CHAR;	/* M2 memories to process with alloc3 */
+DCL	adr_date 	CHAR(30) VAR;	/* date taken from the top of the .ADR file */
+dcl 	file_name	char(50) var;
+dcl	debug		char(30) var;	/* debugging options	*/
+DCL	(debug_a,debug_q,debug_s) BIT(1) ALIGNED;
+dcl	buf		char(255) var;	/* input text line */
+
+dcl	current_date	char(9);	/* postpass date 12-OCT-81 */
+dcl	current_time	char(8);	/* postpass time 11:47:15 */
+
+DCL	no_mcr_time_stamp BIT(1) ALIGNED;	/* True until first heading_1 line */
+DCL	mcr_time_stamp	CHAR(31) VAR;	/* Original Micro-2 time stamp */
+DCL	adr_time_stamp	CHAR(31) VAR;	/* Original Micro-2 time stamp */
+DCL	uld_time_stamp	CHAR(31) VAR;	/* Original Micro-2 time stamp */
+DCL	ext_time_stamp	CHAR(31) VAR;	/* Original Micro-2 time stamp */
+DCL	lnk_time_stamp	CHAR(31) VAR;	/* Original Micro-2 time stamp */
+DCL	lnk_file_stamp	CHAR(13) VAR;	/* Original Micro-2 file name */
+
+dcl	current_page	fixed bin(31);	/* current page number heading1 128..132*/
+dcl	current_line	fixed bin(31);	/* current line within a page */
+dcl	current_lineno	fixed bin(31);	/* current Micro-2 line number */
+dcl	current_h1_file	char(28);	/* heading1 2..29 */
+dcl	current_h1_text	char(18) var;	/* heading2 30..47 */
+dcl	current_h2_file char(28);	/* heading2 2..29 */
+dcl	current_h2_text	char(103) var;	/* heading2 30..132 */
+dcl	at_heading1	bit(1) ALIGNED;		/* true if buf_window = 1st heading */
+dcl	at_heading2	bit(1) ALIGNED;		/* true if buf_window = 2nd heading */
+DCL	at_heading3	BIT(1) ALIGNED;		/* true if buf_window = first line after 2nd heading */
+dcl	no_print	bit(1) ALIGNED;		/* do not print lines on the current page */
+dcl     loc_line_xref	bit(1) ALIGNED;		/* this is a xref page */
+
+dcl 	pre_line 	char(135) var; 	/* buffered output line( the pipe) */
+dcl	pre_line_valid	bit(1) ALIGNED;		/* buffered pipline is valid */
+dcl	pre_prev_ff	bit(1) ALIGNED;
+
+dcl	current_umem	char(1);	/* extracted micro memory */
+dcl	current_uaddr	fixed bin(31);	/* extracted micro address */
+dcl	current_ubits	bit(128) ALIGNED;	/* extracted micro instruction,
+					    left justified */
+
+
+
+dcl	1 buf_window,			/* part before possible FF */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 unused_buf_window,		/* part after possible FF */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 ucode_window,			/* microcode area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 uaddr_window,			/* microcode address area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 ubits_window,			/* microcode bits area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 lineno_window,		/* line number area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 text_window,			/* source text area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 label_window,			/* source label area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 scomment_window,		/* stylized comment area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+/*
+EXAMPLE:
+
+				;2109	FSD.R.OCTA:					;= AT F+6
+				;2110		;---------------------------------------;
+U 016, 01A0,0420,0017,0017	;2111		RN<--RN+1				; incr RN to pt to 1 below next reg to fill
+|---------------------------------------------------------------- buf -------------------------------------------------------------|
+|-----------------------------| ucode_window
+  |-|				uaddr_window
+       |----------------------| ubits_window
+
+
+				;2109	FSD.R.OCTA:					;= AT F+6
+				;2110		;---------------------------------------;
+U 016, 01A0,0420,0017,0017	;2111		RN<--RN+1				; incr RN to pt to 1 below next reg to fill
+|---------------------------------------------------------------- buf -------------------------------------------------------------|
+lineno_window			 |-----|
+text_window				|------------------------------------------------------------------------------------------|
+label_window (shrinks)			|------------------------------------------------------------------------------------------|
+					|--------|
+scomment_window	(shrinks)		|------------------------------------------------------------------------------------------|
+											   |----|
+
+END EXAMPLE
+*/
+
+
+dcl null builtin;
+dcl oncode builtin;
+dcl (infile,mcrfile,old_uldfile,uldfile,allfile,adrfile,extfile,linkfile) file;
+dcl (mcrname,name,old_uldname,uldname,allname,adrname,extname,link_name) char(80) var;
+dcl eof bit(1) ALIGNED;
+dcl myeof bit(1) ALIGNED;
+dcl (tab,ff) char(1);
+dcl is_hexchar(0:255) bit(1) ALIGNED;
+dcl is_decchar(0:255) bit(1) ALIGNED;
+dcl hextable(0:255) fixed bin(31);
+dcl bittable(0:15) bit(4) ALIGNED;
+dcl (starts_name,starts_name_or_numb,in_name) (0:255) bit(1) ALIGNED;
+
+
+dcl 1 cons based,
+	2 car ptr,
+	2 cdr ptr;
+
+dcl pending_labels ptr;
+dcl pending_constraints ptr;
+
+dcl action_list ptr;
+
+dcl p ptr;
+dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+dcl 1 bitpat based,
+	2 link ptr,
+	2 action_number fixed bin(31),
+	2 mask_eq bit(128) ALIGNED,
+	2 data_eq bit(128) ALIGNED,
+	2 mask_neq1 bit(128) ALIGNED,
+	2 data_neq1 bit(128) ALIGNED,
+	2 mask_neq2 bit(128) ALIGNED,
+	2 data_neq2 bit(128) ALIGNED,
+	2 mask_neq3 bit(128) ALIGNED,
+	2 data_neq3 bit(128) ALIGNED;
+
+dcl (has_misc_field, has_true_label, has_false_label) bit(1) ALIGNED;
+dcl has_a_target bit(1) ALIGNED;
+
+/* dcl to_upper		char(255) var;
+   dcl from_lower		char(255) var; */
+%REPLACE from_lower	BY 'abcdefghijklmnopqrstuvwxyz';
+%REPLACE to_upper	BY 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+dcl starts_name_str	char(255) var;
+dcl starts_numb_str	char(255) var;
+dcl starts_name_or_numb_str	char(255) var;
+dcl in_name_str		char(255) var;
+
+
+
+dcl name_stack_ptr fixed bin(31);
+dcl name_stack(0:15) char(31) var;	/* name of each begin/end block	*/
+dcl constraint_stack(0:15) ptr;		/* constraints on each "    "	*/
+dcl line_stack(0:15) fixed bin(31);	/* line number of begin		*/
+
+dcl out_put_line char(135) var;
+dcl form_feed bit(1) ALIGNED;
+DCL do_listing BIT(1) ALIGNED;
+dcl read_file	file	variable;
+dcl print_file	file	variable;
+DCL identity_msg_count FIXED BIN(31);
+
+DCL trixp PTR;
+DCL trix_t BIT(128) ALIGNED BASED(p);
+DCL trix_cs CHAR(16) BASED(p);
+
+
+all_unknown : PROC(i) RETURNS(BIT(1)ALIGNED);
+	/* returns true if adr(i..i+15).page all unknown */
+	DCL (i,j) FIXED BIN(31);
+
+	DO j = 0 TO 15;
+		IF adr(i+j).page^=unknown THEN RETURN(false);
+	END;
+	RETURN(true);
+END all_unknown;
+
+
+copy_old_ubits : proc(new_ubits, old_ubits);
+	/* copy the ubits in 'old_ubits' to the string 'new_ubits'.*/
+	/* 'new_ubits' will become the final U_word 		   */
+
+	dcl t bit(128) ALIGNED;			/* temporary */
+	dcl old_ubits bit(128) ALIGNED; 	/* input, modified! */
+	dcl new_ubits bit(128) ALIGNED;		/* output */
+
+	SUBSTR(new_ubits,1,1)  = '0'B;				/* parity bit */
+	SUBSTR(new_ubits,2,32) = SUBSTR(old_ubits,2,32);	/* alu..bcs */
+	SUBSTR(new_ubits,34,7) = '0000000'B;			/* br offset */
+end; /* copy_old_ubits */	
+
+
+charval : proc(w) returns(char(1));
+	/* pick off first char in window, or blank. UPDATE w	*/
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl c char(1);
+
+	if w.len>0 then
+	    do;
+		c = substr(buf,w.start,1);
+		w.start = w.start+1;
+		w.len   = w.len-1;
+		return(c);
+	    end;
+	else
+	    return(' ');
+end; /* charval */
+
+
+
+decompose_heading_line : proc(w);
+	/* pick all the fields out of a heading line */
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl t char(31) var;	 /* temp for safe char convert */
+	dcl ext_start fixed bin; /* offset  of .MCR extension */
+
+/* put skip  edit ('DECOMP_HEAD:') (a); */
+	at_heading3 = at_heading2;	/* previous line =2, this=3	*/
+	at_heading2 = at_heading1;	/* previous line =1, this=2	*/
+	at_heading1 = (current_line=1);	/* this=1			*/
+
+	ucode_window.start = w.start;
+	ucode_window.len   = 0;
+	lineno_window.start = w.start;
+	lineno_window.len   = 0;
+	text_window.start = w.start;
+	text_window.len   = 0;
+	if at_heading1 then
+	    do; /* decomp heading1 */
+		t = substr(buf,w.start+h1_pageno_col,
+					h1_pageno_len);
+		if verify(t,'0123456789 ')=0 then
+			current_page = bin(t);
+/*		else
+			call error_msg('BAD PAGE # ',t); */
+		current_h1_file = substr(buf,w.start+h1_file_col,
+					h1_file_len);
+		current_h1_text = substr(buf,w.start+h1_text_col,
+					h1_text_len);
+
+		ext_start = index(buf,'.MCR');
+		if ext_start=0 then
+		    call error_msg('No .MCR in heading line on page ',t);
+		else 
+		    do;
+			substr(buf, ext_start, 4) = '.ACR';
+			substr(buf, w.start+field(50).start, 24 ) = 
+				'ALLOC '||current_date||' '||current_time;
+			substr(buf, w.start+field(50).start+26, 20 ) = 
+				'/LINK='||link_name;
+		    end; /* else exstart=0 */
+		IF no_mcr_time_stamp THEN
+		    DO;
+			no_mcr_time_stamp = false;
+			mcr_time_stamp = SUBSTR(buf,w.start+h1_date_col,10) ||
+				     SUBSTR(buf,w.start+h1_time_col,8);
+			put edit('.MCR Time stamp = "',mcr_time_stamp,'"') (A,A,A);
+			put skip;
+			IF adr_time_stamp^=mcr_time_stamp THEN
+				CALL error_msg('ADR time stamp mismatch: ','"'||adr_time_stamp||'"');
+			IF ext_time_stamp^=mcr_time_stamp THEN
+				CALL error_msg('EXT time stamp mismatch: ','"'||ext_time_stamp||'"');
+		    END;
+	    end; /* heading1 */
+	ELSE IF (at_heading2) THEN 
+	    DO;
+		current_h2_file = substr(buf,w.start+h2_file_col,
+					min(h2_file_len,
+					max(w.len-h2_file_col,0)));
+		current_h2_text = substr(buf,w.start+h2_text_col,
+					min(h2_text_len,
+					max(w.len-h2_text_col,0)));
+	    END; /* heading2 */
+
+	ELSE
+	    DO; /* heading3 so fill in the begin end stack */
+		buf = stack_line();			/* GLOBAL */
+		buf_window.start = 1;			/* GLOBAL */
+		buf_window.len = LENGTH(buf);		/* GLOBAL */
+	    END; /* heading3 */
+
+end; /* decompose_heading_line */
+
+
+
+decompose_line : proc(w);
+	/* From the window w, extract ucode_window, and text_window	*/
+	/* Also set current_page, current_line, at_heading1/2		*/
+	/*  current_lineno						*/
+	/* If heading, do current_h* fields.				*/
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 local_w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	current_line = current_line+1;
+	local_w = w;		/* copy is modified by is_heading_line  ! */
+	if is_heading_line(local_w) then
+		call decompose_heading_line(local_w);
+	else
+		call decompose_other_line(local_w);
+
+end; /* decompose_line */
+
+
+decompose_other_line : proc(w);
+	/* pick all the fields out of a non-heading line */
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl i fixed bin(31);
+	dcl t char(31) var;	/* temp for safe char convert */
+
+/* put skip  edit ('DECOMP_OTHER:') (a); */
+	at_heading1 = false;		/* safety move			*/
+	at_heading2 = false;		/* safety move			*/
+	at_heading3 = false;		/* safety move			*/
+	write_stack = false;		/* safety move			*/
+
+	/* NOTE: the test below depends on compiled code branching out
+		on length=0, OR no subscriptrange checking */
+	if (w.len>0) & (substr(buf,w.start,1)=';') then
+	    do; /* .nobin line */
+		do_stacking = false; /* no begin/end stacking on .nobin lines */
+		ucode_window.start = w.start;
+		ucode_window.len   = 0;
+		lineno_window.start = w.start+1;
+		lineno_window.len   = min(w.len-1,7);
+		text_window.start = w.start+8;
+		text_window.len   = max(w.len-8,0);
+		t = substr(buf,
+			lineno_window.start,lineno_window.len);
+		if verify(t,'0123456789 ')=0 then
+			current_lineno = bin(t);
+/*		else
+			call error_msg('BAD LINE # ',t); */
+	    end; /* .nobin line */
+	else
+	    do; /* .bin line or blank */
+		/* look for ucode, lineno separator */
+		i = index(substr(buf,w.start,w.len),';');
+		if i=0 then
+		    do; /* no separator -- treat as blank */
+			ucode_window.start = w.start;
+			ucode_window.len   = 0;
+			lineno_window.start = w.start;
+			lineno_window.len   = 0;
+			text_window.start = w.start;
+			text_window.len   = w.len;
+			/* don't change current_lineno */
+		    end; /* no separator */
+		else
+		    do; /* .bin line */
+			ucode_window.start = w.start;
+			ucode_window.len   = i-1;
+			lineno_window.start = w.start+i;	/* after ; */
+			lineno_window.len   = min(w.len-i,7);
+			text_window.start = w.start+(i-1)+8;	/* ; + 8   */
+			text_window.len   = max(w.len-(i-1)-8,0);
+			t = substr(buf,
+				lineno_window.start,lineno_window.len);
+			if verify(t,'0123456789 ')=0 then
+				current_lineno = bin(t);
+/*			else
+				call error_msg('BAD LINE # ',t); */
+		    end; /* .bin line */
+	    end; /* .bin line or blank */
+/* put skip ;
+put skip  edit(buf) (a);
+call putwindow(ucode_window,'u');
+call putwindow(lineno_window,'#');
+call putwindow(text_window,'t');
+put skip  edit('lineno=',current_lineno) (a,a); */
+end; /* decompose_other_line */
+
+
+
+decval : proc(s,w) returns(fixed bin(31));
+	/* pick off first dec const in window, or 0. UPDATE w	*/
+	/* skips over leading non-dec chars			*/
+	/* leaves w pointing to first non-dec char in window	*/
+
+	dcl s char(255) var;
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl i fixed bin(31), c char(1);
+
+	i = 0;
+	do while( (w.len>0) & ^is_decchar(rank(substr(s,w.start,1))) );
+		w.start = w.start+1;
+		w.len   = w.len-1;
+	end;
+	do while( (w.len>0) & is_decchar(rank(substr(s,w.start,1))) );
+		c = substr(s,w.start,1);
+		i = i*10 + rank(c) - rank('0');
+		w.start = w.start+1;
+		w.len   = w.len-1;
+	end;
+	return(i);
+end; /* decval */
+
+
+dump_bits : proc(b);
+	/* print bitstring */
+	dcl b bit(128) ALIGNED;
+
+	put skip edit(b)(a);
+end; /* dump_bits */
+
+
+
+dump_ptr : proc(p) returns(char(31)var);
+	/* convert a pointer to 8 hex chars */
+	dcl p ptr;
+	dcl c char(31)var;
+	put string(c) edit(unspec(p)) (b4);
+	return(c);
+end; /* dump_ptr */
+
+
+enqueue : proc(anchor,p);
+	/* add p to linked list anchor */
+	dcl (anchor,p) ptr;
+	dcl q ptr;
+
+	allocate cons set(q);
+	q->cons.car = p;
+	q->cons.cdr = anchor;
+	anchor = q;
+end; /* enqueue */
+
+
+hex_mcr_time_stamp : PROC RETURNS(CHAR(10));
+	/* convert MCR time stamp to 00mmddhhmm */
+	DCL c10 CHAR(10);
+	DCL i FIXED BIN(31);
+
+/*	
+mcr_time_stamp:
+" 3-APR-82 21:06:50"
+ 123456789.123456789.
+*/
+	c10 = '0000000000';
+	i = INDEX('JANFEBMARAPRMAYJUNJULAUGSEPOCTNOVDEC',
+		SUBSTR(mcr_time_stamp,4,3));
+	i = DIVIDE(i-1,3,31,0)+1;			/* 1-12 */
+	SUBSTR(c10,3,1) = BYTE( DIVIDE(i,10,31,0) + RANK('0') );
+	SUBSTR(c10,4,1) = BYTE( MOD(i,10)         + RANK('0') );
+	SUBSTR(c10,5,2) = SUBSTR(mcr_time_stamp,1,2);
+	SUBSTR(c10,7,2) = SUBSTR(mcr_time_stamp,11,2);
+	SUBSTR(c10,9,2) = SUBSTR(mcr_time_stamp,14,2);
+	IF SUBSTR(c10,5,1)=' ' THEN
+		SUBSTR(c10,5,1) = '0';
+	IF SUBSTR(c10,7,1)=' ' THEN
+		SUBSTR(c10,7,1) = '0';
+	RETURN(c10);
+END hex_mcr_time_stamp;
+
+
+epilogue : proc;
+
+put file(uldfile) edit('[7FF0]='||hex_mcr_time_stamp()) (A);
+put file(uldfile) skip;
+put file(uldfile) edit(';     ALLOCATED '||current_date||' '
+	||current_time|| ' >>>') (a);
+put file(uldfile) skip;
+
+put skip edit ('Closing file ',mcrname) (a,a);
+close file(mcrfile);
+put skip edit ('Closing file ',uldname) (a,a);
+close file(uldfile);
+put skip edit ('Closing file ',old_uldname) (a,a);
+close file(old_uldfile);
+put skip edit ('Closing file ',allname) (a,a);
+close file(allfile);
+put skip edit ('Closing file ',extname) (a,a);
+close file(extfile);
+end; /* epilogue */
+
+
+error_msg : proc(s1,s2);
+	/* print an error message and return */
+	dcl (s1,s2) char(31) var;
+	put  edit('*** line', current_lineno,s1,s2) 
+			(a,f(6),x(1),a,a); put  skip; 
+end; /* error_msg */
+
+
+expand : proc(line, final_length) returns(char(*));
+	/* expand the string to the 'final_length' */
+	dcl line char(250) var;
+	dcl final_length fixed bin(31);
+
+	do while (length(line) < final_length);
+		line = line||' ';
+	end; /* while length(line) < final_length */
+	return(line);
+end; 	/* expand */
+
+
+extract_pattern : proc(s) returns(ptr);
+	/* read in a single bit pattern from string s. */
+	/* if blank line, return null, else return ptr to bitpat */
+
+/*
+	x = don't care
+	0 1 = must be zero/one
+	, ' = the complete field must NOT equal the corresponding 0,1 pattern
+	- | = the complete field must NOT equal the corresponding 0,1 pattern
+	. ^ = the complete field must NOT equal the corresponding 0,1 pattern
+*/
+
+	dcl s char(255) var;
+	dcl p ptr, (i,k) fixed bin(31), c char(1);
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	if length(s)=0 then
+		return(null);
+
+	w.start = 1;  w.len = length(s);
+
+	allocate bitpat set(p);
+	p->bitpat.link = null;
+	p->bitpat.action_number = decval(s,w);
+	p->bitpat.mask_eq	= '0'b;
+	p->bitpat.data_eq	= '0'b;
+	p->bitpat.mask_neq1	= '0'b;
+	p->bitpat.data_neq1	= '0'b;
+	p->bitpat.mask_neq2	= '0'b;
+	p->bitpat.data_neq2	= '0'b;
+	p->bitpat.mask_neq3	= '0'b;
+	p->bitpat.data_neq3	= '0'b;
+
+	k = 0;
+	do i=w.start to w.start+w.len-1;
+		c = substr(s,i,1);
+		if index (' xX01,''-|.^',c)=0 then goto exit_label;
+		if index ('xX01,''-|.^',c)^=0 then k = k+1;
+		if c='0' then
+		    do; substr(p->bitpat.mask_eq,k,1) = '1'b;
+			substr(p->bitpat.data_eq,k,1) = '0'b; end;
+		if c='1' then
+		    do; substr(p->bitpat.mask_eq,k,1) = '1'b;
+			substr(p->bitpat.data_eq,k,1) = '1'b; end;
+		if c=',' then
+		    do; substr(p->bitpat.mask_neq1,k,1) = '1'b;
+			substr(p->bitpat.data_neq1,k,1) = '0'b; end;
+		if c='''' then
+		    do; substr(p->bitpat.mask_neq1,k,1) = '1'b;
+			substr(p->bitpat.data_neq1,k,1) = '1'b; end;
+		if c='-' then
+		    do; substr(p->bitpat.mask_neq2,k,1) = '1'b;
+			substr(p->bitpat.data_neq2,k,1) = '0'b; end;
+		if c='|' then
+		    do; substr(p->bitpat.mask_neq2,k,1) = '1'b;
+			substr(p->bitpat.data_neq2,k,1) = '1'b; end;
+		if c='.' then
+		    do; substr(p->bitpat.mask_neq3,k,1) = '1'b;
+			substr(p->bitpat.data_neq3,k,1) = '0'b; end;
+		if c='^' then
+		    do; substr(p->bitpat.mask_neq3,k,1) = '1'b;
+			substr(p->bitpat.data_neq3,k,1) = '1'b; end;
+		/* if c='x' or c='X' or c=' ' then do nothing further */
+	end; /* char loop */
+exit_label:
+	return(p);
+end; /* extract_pattern */
+
+
+find_field : proc(p,w);
+	/* returns a window to the first field in mask_eq */
+	dcl p ptr;
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	if p=null then
+		do; w.start = 1; w.len = 0; end;
+	else
+	    do;
+		w.start = index(p->bitpat.mask_eq, '1'b);
+		if w.start=0 then
+			do; w.start = 1; w.len = 0; end;
+		else
+			w.len = index( substr(p->bitpat.mask_eq,w.start), '0'b) - 1;
+	    end;
+end; /* find_field */
+
+
+get_adr : PROC (old_addr) RETURNS(FIXED BIN(31));
+	/* returns new address associated with old address */
+	/* complains exactly once for any unknown old addresses */
+
+	DCL old_addr FIXED BIN(31);
+	DCL new_addr FIXED BIN(31);
+
+	new_addr = adr(old_addr).new;
+	IF new_addr = unknown THEN
+	    DO;
+		IF identity_msg_count<20 THEN
+			CALL error_msg('No mapping. IDENTITY USED. ',
+				hex_char(old_addr,4));
+		IF identity_msg_count=20 THEN
+			CALL error_msg('IDENTITY USED. msg suppressed. ',
+				hex_char(old_addr,4));
+		identity_msg_count = identity_msg_count + 1;
+		adr(old_addr).new = old_addr;
+		new_addr = old_addr;
+	    END;
+	RETURN(new_addr);
+END get_adr;
+
+
+get_name : proc(w,l) returns(char(31)var);
+	/* put out name from buf, checking length			*/
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl l fixed bin(31);
+	dcl name char(31) var;
+
+	if w.len<=l then
+	    name = substr(buf,w.start,w.len);
+	else
+	    do;
+		call error_msg('NAME TOO LONG. TRUNCATED. ',
+			substr(buf,w.start,w.len));
+		name = substr(buf,w.start,l);
+	    end;
+	return(name);
+end; /* get_name */
+
+
+get_pageno : PROC (new_addr,quiet,all) RETURNS(CHAR(5));
+	/* Find page number of NEW address and return 5-char string. */
+	/* link input:		-EXT-	*/
+	/* unknown page:	-UNK-	*/
+	/* unknown page:	_____	(option) */
+	/* = current page:	_____	(option) */
+	/* pages    0-9:	_p._x	*/
+	/* pages   10-99:	_p.xx	*/
+	/* pages  100-999:	_pxxx	*/
+	/* pages 1000-9999:	pxxxx	*/
+	/* pages >= 10000:      xxxxx	*/
+
+	DCL new_addr FIXED BIN(31);
+	DCL (quiet,all) BIT(1) ALIGNED;
+	DCL new_page FIXED BIN(31);
+	DCL s CHAR(5);
+
+	new_page = adr(new_addr).page;
+	IF new_page=unknown		THEN
+		IF quiet		THEN RETURN('     ');
+					ELSE RETURN('-UNK-');
+	IF new_page=extrn		THEN RETURN('-EXT-');
+	IF new_page=current_page & ^all	THEN RETURN('    ');
+	IF new_page>9999		THEN RETURN(        mychar(new_page));
+	IF new_page>999			THEN RETURN('p'   ||mychar(new_page));
+	IF new_page>99			THEN RETURN(' p'  ||mychar(new_page));
+	IF new_page>9			THEN RETURN(' p.' ||mychar(new_page));
+					     RETURN(' p. '||mychar(new_page));
+END get_pageno;
+
+
+hexbits : proc(w) returns(bit(128) ALIGNED);
+	/* pick off hex bitstring in w, or null. UPDATE w	*/
+	/* packs all hex chars into bitstring, skips all others	*/
+	/* w will always be empty on exit			*/
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl (i,k) fixed bin(31), c char(1);
+	dcl temp bit(128);
+	dcl temphex(0:31) bit(4) defined(temp);
+
+	temp = '0'b;
+	k = -1;
+	do i = w.start to w.start+w.len-1;
+		if is_hexchar(rank(substr(buf,i,1))) then
+		    do;
+			if k<31 then
+				k = k+1;
+			else
+				call error_msg('HEX TOO LONG ',substr(buf,i,1)) ;
+			temphex(k) = bittable(hextable(rank(substr(buf,i,1))));
+		    end;
+		else
+		    do;
+		    end;
+	end;
+	w.start = w.start + w.len;
+	w.len   = 0;
+	return(temp);
+end; /* hexbits */
+
+
+hex_character: proc(bits) returns(char(1));
+	dcl bits	bit(4) ALIGNED;
+
+	RETURN( hex_table( bin(bits) ));
+end; /* hex_character */	
+
+hex_char : proc ( number, n ) returns( char(*) var );
+	/* create a N digit hex string out of the fixed binary passed in */
+	/* max N of 7 */
+	DCl	n		FIXED BIN(31);
+	DCL	number 		FIXED BIN(31);
+	DCL	string		BIT(31) ALIGNED;
+	DCL	long_string 	BIT(128) ALIGNED;
+	DCL	hex_ch		CHAR(20) VAR;
+
+	string = MYBIT( number, 4*N );  
+
+	SUBSTR( long_string, 1, 31) = string;
+
+	hex_ch = hex_string( long_string, N, 0, '');
+
+
+	RETURN( hex_ch );
+END; /* hex_char */
+
+hex_string : proc( bit_string, digit_len, break_cnt,break_char) 
+	     returns(char(*));
+	/* convert the 'bit_string' to 'digit_len' number of hex digits */
+	/* insert the 'break_char' at intervals of 'break_cnt' hex	*/
+	/* digits from the front of the hex character string.   	*/
+	/* return the complete hex string of characters 		*/
+	/* ASSUME THAT BIT_STRING HAS MULTIPLE OF 4 VALID BITS		*/
+	/* LEFT JUSTIFIED!						*/
+
+	dcl bit_string bit(128) ALIGNED;
+	dcl digit_len  fixed bin(31);
+	dcl break_cnt fixed bin(31);
+	dcl break_char char(20) var;
+
+	dcl hex_str char(100) var;
+	dcl final_hex  char(100) var;
+	dcl next_char	fixed bin(31);
+	dcl i		fixed bin(31);
+
+
+	hex_str = '';
+
+	do i = 0 to  digit_len-1 by 1;	/* create 'digit_len' hex characters */
+		hex_str = hex_str||hex_character( substr( bit_string, i*4+1, 4 ));
+	end; /* create digit_len hex characters */
+
+
+	if ( break_cnt = 0 )!( break_cnt > length(hex_str ))
+	then 	do;
+		return( hex_str ); /* exit the function */
+		end; /* then break_count = 0 */
+	else	do;  /* insert a break character */
+
+		final_hex = '';	   /* init  the final hex string	  */
+		next_char = 1;	   /* where to get next  character from   */
+
+			do while (next_char <= length(hex_str));
+			final_hex = final_hex||substr(hex_str, 
+				next_char, 1);
+			IF (mod( next_char, break_cnt ) = 0)&(next_char ^= length(hex_str) )
+			THEN final_hex = final_hex||break_char;
+
+			next_char = next_char + 1;
+			end; /* do while */		
+
+		return(final_hex);
+		end; /* else  break_cnt = 0 */
+
+end; /* hex_string */		
+
+
+hexval : proc(w) returns(fixed bin(31));
+	/* pick off first hex const in window, or 0. UPDATE w	*/
+	/* skips over leading non-hex chars			*/
+	/* leaves w pointing to first non-hex char in window	*/
+	/* does not work for 8-digit negatives (overflows)	*/
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl i fixed bin(31), c char(1);
+
+	i = 0;
+	do while( (w.len>0) & ^is_hexchar(rank(substr(buf,w.start,1))) );
+		w.start = w.start+1;
+		w.len   = w.len-1;
+	end;
+	do while( (w.len>0) & is_hexchar(rank(substr(buf,w.start,1))) );
+		c = substr(buf,w.start,1);
+		i = i*16 + hextable(rank(c));
+		w.start = w.start+1;
+		w.len   = w.len-1;
+	end;
+	return(i);
+end; /* hexval */
+
+
+init_byte_parity : PROC (i,j,k);
+	/* init byte_parity(i..i+j-1) to have k bits per byte */
+	DCL (i,j,k,jj) FIXED BIN(31);
+
+	IF j=1 THEN
+		byte_parity(i) = k;
+	ELSE
+	    DO;
+		jj = DIVIDE(j,2,31,0);
+		CALL init_byte_parity(i,jj,k);
+		CALL init_byte_parity(i+jj,jj,k+1);
+	    END;
+	RETURN;
+END init_byte_parity;
+
+
+insert_pre_line : proc(line, string, column );
+	/* insert the 'string' into the 'line' */
+	/* if the 'line' is not long enough then append blanks */
+	/* if the line does not have blanks upto the end of the insert */
+	/* complain loudly!  and do not do the insert */
+
+	dcl line char(250) var; 
+	dcl string char(250) var;
+	dcl string_len fixed bin(31);
+	dcl line_len fixed bin(31);
+	dcl column fixed bin(31);
+
+	string_len = length(string);
+	line_len = length(line);
+
+	if line_len < column+string_len 
+	then 	do;
+		line = expand(line, column+string_len); /* make room */
+		end;
+
+	if ( substr( line, column, string_len ) = ' ' )
+	then 	do;
+		substr( line, column, string_len ) = string;
+		end; /* then do */
+	else	do;
+		IF ^debug_q THEN
+		call error_msg('Nonblank field in prev. line. ',
+				'POSSIBLE MISSING COMMA.');
+		end;
+
+end; /* insert_pre_line */
+
+
+is_heading_line : proc(w) returns(bit(1) ALIGNED);
+	/* returns true if we are at a heading line. 			*/
+
+	/* A heading line is:						*/
+	/*	a line containing ".MCR" and "Page" (1)			*/
+	/*	or the one after that (2)				*/
+	/*	or the one after that (3)				*/
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	IF INDEX(buf,'.MCR')^=0 THEN
+	    IF INDEX(buf,'Page')^=0 THEN
+		IF w.len>=h1_pageno_col THEN
+		    DO; /* first line of page, DO SIDE EFFECTS */
+			current_line = 1;		/* reset count	*/
+			return( true );
+		    END; /* first line of page */
+
+	IF      at_heading1 then /* previous line was heading1, so this is 2 */
+		return(true);
+	ELSE IF at_heading2 then /* previous line was heading 2 so this is 3 */
+		return(true);
+	ELSE
+		return(false);
+end; /* is_heading_line */
+
+
+
+
+match_bits : proc(b,p) returns(bit(1) ALIGNED);
+	/* returns true if bitstring b matches pattern p */
+	dcl b bit(128) ALIGNED;
+	dcl p ptr; /* to a bitpat */
+
+if index(debug,'M')^=0 then
+do; put  edit('match: ',b) (a,a); put  skip;
+    put  edit(' m_eq: ',p->bitpat.mask_eq) (a,a); put  skip;
+    put  edit(' d_eq: ',p->bitpat.data_eq) (a,a); put  skip;
+    put  edit(' neq1: ',p->bitpat.mask_neq1) (a,a); put  skip;
+    put  edit(' d_  : ',p->bitpat.data_neq1) (a,a); put  skip;
+    put  edit(' neq2: ',p->bitpat.mask_neq2) (a,a); put  skip;
+    put  edit(' d_  : ',p->bitpat.data_neq2) (a,a); put  skip;
+    put  edit(' neq3: ',p->bitpat.mask_neq3) (a,a); put  skip;
+    put  edit(' d_  : ',p->bitpat.data_neq3) (a,a); put  skip;
+end;
+	if (b&p->bitpat.mask_eq) ^= p->bitpat.data_eq        then return(false);
+	if p->bitpat.mask_neq1 ^= '0'b then
+	    if (b&p->bitpat.mask_neq1) = p->bitpat.data_neq1 then return(false); 
+	if p->bitpat.mask_neq2 ^= '0'b then
+	    if (b&p->bitpat.mask_neq2) = p->bitpat.data_neq2 then return(false); 
+	if p->bitpat.mask_neq3 ^= '0'b then
+	    if (b&p->bitpat.mask_neq3) = p->bitpat.data_neq3 then return(false); 
+	return(true);
+end; /* match_bits */
+
+
+mybit : proc(binary,len) returns(bit(31) ALIGNED);
+	/* align a SIGNED bit string of a binary value */
+	dcl binary fixed bin(31);
+	dcl len fixed bin(31);
+	dcl q bit(31) ALIGNED;
+	dcl tmp bit(31) ALIGNED;
+
+	tmp = signed_bit(binary);
+
+	q = substr(tmp,32-len,len);
+	return(q);
+
+end; /* mybit */
+
+signed_bit : proc(binary) returns(bit(31) ALIGNED);
+	/* return a 31 bit long string of the 	*/
+	/* signed binary number 		*/
+	dcl binary	fixed bin(31);
+	dcl string	bit(31) ALIGNED;
+	dcl i 		fixed bin(31);
+	dcl carry	bit(1) ALIGNED;
+
+	string = bit( binary);
+
+
+	if binary < 0
+	THEN	do;
+		string = complement(string);
+		carry = '1'B;
+		do i = 31 to 1 by -1;
+			if (substr(string , i, 1) = '1'B)&( carry = '1'B)
+			THEN substr(string, i, 1) = '0'B;
+			ELSE do;
+			     if (substr(string, i, 1) = '0'B)&( carry = '1'B)
+			     THEN do; carry = '0'B;
+				  substr(string, i, 1) = '1'B;
+				  end;
+			     end;
+		end; /* i =31 to 1 by -1 */
+	
+		end; /* binary < 0 */
+	return( string);
+end; /* signed_bit */
+
+complement : proc(string) returns(bit(31) ALIGNED);
+	/* complement a bit string */
+	dcl string	bit(31) ALIGNED;
+
+	return( bool(string,'0'B,'1100'B) );
+end; /* complement */
+
+
+
+mychar : proc(number) returns(char(*) var);
+	/* return a left justified character string */
+	/* no leading blanks				    */
+	
+	dcl number	fixed bin(31);
+	dcl number_char char(250) var;
+	dcl string 	char(250) var;
+	dcl i		fixed bin(31);
+
+	number_char = character( number);
+	i = verify( number_char,' '); /* pos of first char */
+	string = substr( number_char, i, length(number_char)-i+1);
+	return(string);
+end; /* mychar */	
+	
+
+ok_to_print : PROC(w) RETURNS(BIT(1) ALIGNED);
+	/* 
+	   turn off listing (& return true) if start of xref
+	   return false if do-listing is off
+	   return true if header1 lines, or
+	   suppress other lines that are
+	     completely empty, or
+	     empty text, or
+	     starting with ';' or
+	     first non-blank char in text field is ';'
+	*/
+	DCL 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	DCL i FIXED BIN(31);
+
+	IF^do_listing THEN RETURN(false);
+	IF at_heading2 & INDEX(buf,'Cross Ref')^=0 THEN
+	    DO;	do_listing = false; RETURN(true); END;
+	IF form_feed THEN RETURN(true);
+	IF w.len=0 THEN RETURN(false);
+	IF text_window.len=0 THEN RETURN(false);
+	IF wchar(w)=';' THEN RETURN(false);
+	i = wverify(text_window,' ');
+	IF i>text_window.len THEN RETURN(false);
+	IF SUBSTR(wcont(text_window),i,1)=';' THEN RETURN(false);
+	RETURN(true);
+END ok_to_print;
+
+
+page_buf : PROC( page1, page2, add1, add2 );
+
+	DCL page1 	CHAR(5);
+	DCL page2	CHAR(5);
+	DCL add1	CHAR(4);
+	DCL add2	CHAR(4);
+
+	IF ^process_uld
+	THEN	DO;
+
+		IF LENGTH( pre_line ) < field(60).start+field(60).len
+		THEN	pre_line = pre_line||'                                            '; /* about 40 blanks */
+
+		IF (SUBSTR( pre_line, field(59).start, 5 )) = ' '
+		THEN	SUBSTR( pre_line, field(59).start, 5 ) = page1;
+		ELSE IF ^debug_q THEN
+			CALL error_msg( 'Nonblank field prev. line. ',
+				'POSSIBLE MISSING COMMA.' );
+
+		IF (SUBSTR( pre_line, field(60).start, 5 )) = ' '
+		THEN	SUBSTR( pre_line, field(60).start, 5 ) = page2;
+		ELSE IF ^debug_q THEN
+			CALL error_msg( 'Nonblank field prev. line. ',
+				'POSSIBLE MISSING COMMA.' );
+
+		IF (SUBSTR( buf, field(57).start, 4 )) = ' '
+		THEN	SUBSTR( buf, field(57).start, 4 ) = add1;
+		ELSE IF ^debug_q THEN
+			CALL error_msg( 'Not a blank for ','printing the 1st address.' );
+
+		IF (SUBSTR( buf, field(58).start, 4 )) = ' '
+		THEN	SUBSTR( buf, field(58).start, 4 ) = add2;
+		ELSE IF ^debug_q THEN
+			CALL error_msg( 'Not a blank for ','printing the 2nd address.' );
+
+		END; /* process_uld = false */
+
+end;	/* page_buf */
+
+
+parity : PROC( new_ubits, address ) returns(bit(1) ALIGNED);
+	/* calculate odd parity over 40 ubits, and optionally over address */
+
+	DCL     new_ubits	BIT(128) ALIGNED;
+	DCL	address		FIXED BIN(31);
+
+	DCL	address_bits	BIT(31) ALIGNED;
+	DCL	total_bits	FIXED BIN(31);
+	DCL	i		FIXED BIN(31);
+
+	trixp -> trix_t = new_ubits;
+	total_bits = 0;
+	DO i = 1 TO 5;
+		total_bits = total_bits +
+			byte_parity(rank(SUBSTR(trixp->trix_cs,i,1)));
+	END;
+if index(debug,'X')^=0 then do; put edit('total_bits= ',total_bits)(a,a); 
+put skip; end;
+
+	RETURN( MOD(total_bits,2)=0 );
+END; /* parity */
+
+
+perform_actions : proc(new_ubits, page);
+	/* for each action on action_list that matches the current */
+	/* microinstruction, do that action. The array field holds */
+	/* one-origin windows to various bit fields. */
+	dcl page bit(1) ALIGNED;
+	dcl (p,q) ptr;
+	dcl n fixed bin(31);
+	dcl exit_actions bit(1) ALIGNED;
+	dcl new_ubits bit(128) ALIGNED;
+
+	has_misc_field = true;
+	true_label = true;
+	false_label = true;
+	has_a_target = true;
+	float_flag = false;
+
+	page_true_char  = '     ';
+	page_false_char = '     ';
+	target_add_char = '    ';
+	false_add_char  = '    ';
+
+	q = action_list;
+	exit_actions = false;
+	do while( (q^=null) & (^exit_actions) );
+		p = q->cons.car;
+
+		if index(debug,'R')^=0 then do; 
+		 put  edit('try',p->bitpat.action_number)(a,f(5));
+		 put  skip; 
+		end; /* debug */
+
+		if match_bits(current_ubits,p) then
+		    do; /* do the matching action */
+			n = p->bitpat.action_number;
+
+			call u_action(n, new_ubits, exit_actions, page); 
+		    end; /* do the matching action */
+
+		q = q->cons.cdr;
+	end; /* do while */
+
+end; /* perform_actions */
+
+
+print_xref : PROC;
+	/* print cross_references of new addr vs. page # */
+	DCL (i,j,k) FIXED BIN(31);
+	DCL (unused_lo,unused_hi) FIXED BIN(31);
+
+	PUT FILE(allfile) EDIT(ff||'Cheap ALLOC3 Cross-Reference Listing ') (A);
+	PUT FILE(allfile) SKIP;
+	PUT FILE(allfile) SKIP;
+	PUT FILE(allfile) EDIT('/LINK= ',lnk_file_stamp, ' ', lnk_time_stamp)
+		(A,A,A,A);
+	PUT FILE(allfile) SKIP;
+	PUT FILE(allfile) SKIP;
+	PUT FILE(allfile) EDIT('Loc.       0     1     2     3        4     5     6     7        8',
+		'     9     A     B        C     D     E     F') (A,A);
+	PUT FILE(allfile) SKIP;
+	PUT FILE(allfile) SKIP;
+
+	unused_lo = 32768;
+	unused_hi = -1;
+
+	DO i = 0 TO 32767 BY 16;
+		IF all_unknown(i) THEN
+		    DO;
+			unused_lo = MIN(unused_lo,i);
+			unused_hi = MAX(unused_hi,i+15);
+		    END;
+		ELSE
+		    DO;
+			IF unused_lo<unused_hi THEN
+			    DO;
+				PUT FILE(allfile) EDIT(hex_char(unused_lo,4),
+					' - ',hex_char(unused_hi,4),' Unused') (A,A,A,A);
+				PUT FILE(allfile) SKIP;
+				unused_lo = 32768;
+				unused_hi = -1;
+			    END;
+			PUT FILE(allfile) EDIT(hex_char(i,4)) (A(8));
+			DO j = 0 TO 15;
+				PUT FILE(allfile) EDIT(get_pageno(i+j,true,true))(A(6));
+				IF (j=3) | (j=7) | (j=11) THEN
+					PUT FILE(allfile) EDIT(' | ')(A);
+			END; /* do j */
+			PUT FILE(allfile) SKIP;
+		    END;
+	END; /* do i */
+END print_xref;
+
+
+process_one_line : proc;
+
+	call decompose_line(buf_window);
+
+	call stack_begins_ends(buf_window);
+
+	if ucode_window.len>0 then
+	    do;
+
+		call process_ucode(ucode_window);	
+
+		if index(debug,'W')^=0 then
+		do; 	call putwindow(ucode_window,'u'); 
+			call putwindow(lineno_window,'#');
+			call putwindow(text_window,'t'); 
+		end;
+	    end;
+end; /* process_one_line */
+
+process_one_uldline : proc;
+	/* process one uld line.  terminate with a newly formated */
+	/* uld line in BUF.  If not a uld line containing microcode */
+	/* return with no changes to the BUF entry 		  */
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 tok, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl new_ubits bit(128) ALIGNED;
+	dcl cha char(50) var;
+	if length(buf)=0 then return;
+
+	if substr(buf, 1, 1) = '[' 
+	then 	do;	/* have a ucode line ? */
+		w.start = 2;
+		w.len   = length(buf) - 1;
+
+		current_uaddr = hexval(w); 	/* current address */
+
+		call token(w,tok);	/* tok holds next thing in buf */
+		cha = substr(buf,tok.start,tok.len);
+
+		if cha = ']' 
+		then 	do;	/* check rest of line and process uld line */
+			call token(w,tok);  /* tok holds next thing in buf */
+			cha = substr(buf,tok.start,tok.len);
+
+			if wverify(tok, starts_name_str||'=' )^=0	
+			then do;	/* get the memory */
+			     current_umem = substr(buf, tok.start, tok.len);
+			     if (current_umem = '=') then current_umem = 'U';
+
+			     current_ubits = hexbits(w);	/* get the ucode */
+			IF current_umem = 'U'
+			then do;
+			     call copy_old_ubits(new_ubits, current_ubits);
+			     call perform_actions(new_ubits, false);/* no page numbering */
+				IF (use_parity)
+				THEN	substr(new_ubits, field(20).start, field(20).len) = 
+					parity( new_ubits, source_add );
+			     call replace_buf_uld(new_ubits);
+			     end; /* current_umem = 'U'  don't mess up other memories */
+
+			     return;	/* go write the line! */
+			     end;	/* tok, starts_name_str   leave line */				
+
+			else; 	/* tok, starts_name_str   leave line */				
+			end; /* cha = ]  leave the line */
+
+		else	do;	/* cha = ]  leave the line */
+
+		/* abnormal exit due to bad character in file */
+		/* process as a regular line after error message */
+
+		call error_msg( 'bad character found ',
+				'where "]" or "="expected in ULD');
+			end; /* else cha = ] */
+
+		end; /* have a ucode line */
+
+	else;	/* don't have a ucode line          */
+	/* at this point check for fixing field     */
+	/* bit offsets and for fixing ADDRESS field */
+
+end; /* process_one_uldline */
+
+
+process_ucode : proc(w);
+	/* extract the microcode address and bitstring, if any	*/
+	/* the address consists of a single-letter memory name,	*/
+	/* plus an integer (hex) address.			*/
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 local_x, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 local_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl new_ubits bit(128) ALIGNED;	       /* updated Ubits */
+	dcl local_y fixed bin(31);
+
+	if (w.len>0) & (wchar(w)^=' ') then
+	    do; /* non-blank ucode */
+		/* set current_umem, _uaddr, _ubits */
+		local_w = w;		 	  /* gets updated */
+		current_umem  = charval(local_w); /* character    */
+		local_y = local_w.start;
+		current_uaddr = hexval(local_w);  /* fixed binary */
+		current_ubits = hexbits(local_w); /* bit string   */
+
+	IF INDEX( memories, current_umem ) ^= 0
+	THEN 	DO;
+
+		CALL copy_old_ubits(new_ubits, current_ubits);
+		CALL perform_actions(new_ubits, true);/* fix current_ubits field */
+		IF (use_parity)
+		THEN	substr(new_ubits, field(20).start, field(20).len) = 
+			parity( new_ubits, source_add );
+		CALL replace_buf(new_ubits);
+	        CALL page_buf( page_true_char, page_false_char, target_add_char, false_add_char );
+		END; /* current_umem = on of the memories */
+
+	    end; /* non-blank ucode */
+end; /* process_ucode */
+
+
+
+
+GET_FILE_AND_DEBUG: PROCEDURE;
+%include $stsdef;
+declare lib$get_foreign external entry(char(*)) options(variable) returns(fixed binary(31));
+declare (input_BUFFER) character(132);
+DECLARE (POINT_START,BUFF_START,POINT_END) FIXED BINARY(31);
+
+
+INPUT_BUFFER=' ';
+
+sts$value=lib$get_foreign(input_BUFFER);
+
+INPUT_BUFFER = translate(INPUT_BUFFER,to_upper,from_lower);
+
+POINT_START=VERIFY(INPUT_BUFFER,' ');
+
+IF POINT_START^= 0 THEN DO;
+	POINT_END = INDEX(SUBSTR(INPUT_BUFFER,POINT_START,132-POINT_START),' ');
+	FILE_NAME=SUBSTR(INPUT_BUFFER,POINT_START,POINT_END-POINT_START);
+
+	BUFF_START=INDEX(INPUT_BUFFER,'/DEBUG=');
+	IF BUFF_START=0 THEN
+		DEBUG='';
+	ELSE 
+		DEBUG = SUBSTR(INPUT_BUFFER,BUFF_START+7,INDEX(SUBSTR(INPUT_BUFFER,BUFF_START+7),' ')-1);
+
+	BUFF_START=INDEX(INPUT_BUFFER,'/LINK=');
+	IF BUFF_START=0 THEN
+		link_name='';
+	ELSE 
+		link_name= SUBSTR(INPUT_BUFFER,BUFF_START+6,INDEX(SUBSTR(INPUT_BUFFER,BUFF_START+6),' ')-1);
+
+END;
+
+ELSE DO;
+	PUT SKIP LIST('INPUT FILE prefix: ');
+	GET LIST(FILE_NAME);
+
+
+	/* ---------- OPTIONS ------------------------------------------------------- */
+	put skip edit('tR(y W(indow X(hex T(okens ') (a);
+	put skip edit('M(atch V(erify ') (a);
+	put skip edit('B(stack  X(noparity  Y(use address for parity  ') (a);
+	put skip edit('D(upl check A(ll_pageno Q(uiet S(queeze') (a);
+
+	put skip edit('Debugging options: ') (a);
+	get list(debug);
+
+	put skip edit('LINK FILE prefix: ') (a);
+	get list(link_name);
+END;
+
+put skip edit('Debugging options: ') (a);		
+debug = translate(debug,to_upper,from_lower);
+put skip list(debug);
+debug_a = (INDEX(debug,'A')^=0);
+debug_q = (INDEX(debug,'Q')^=0);
+debug_s = (INDEX(debug,'S')^=0);
+
+END get_file_and_debug;
+
+
+
+prologue : proc;
+dcl i fixed bin(31);
+dcl random_bit bit(1) ALIGNED;
+dcl dt char(6); 
+dcl tt char(8);
+dcl months(1:12) char(3) static readonly initial(
+	'Jan','Feb','Mar','Apr','May','Jun',
+	'Jul','Aug','Sep','Oct','Nov','Dec');
+
+put skip list ('ADDRESS ALLOCATOR, PASS 3. '||compile_date);
+
+
+call GET_FILE_AND_DEBUG;
+
+MCRNAME=file_name ||'.MCR';
+old_uldname =file_name ||'.ULD';
+extname =file_name ||'.EXT';
+adrname =file_name ||'.BDR';
+
+allname =file_name ||'.ACR';
+uldname = file_name ||'.U40';
+
+put skip edit ('Opening file ',mcrname) (a,a);
+open file(infile) record input title(mcrname);
+
+put skip edit ('Opening file ',old_uldname) (a,a);
+open file(old_uldfile) record input title(old_uldname);
+
+put skip edit ('Opening file ',allname) (a,a);		/* .ACR file */
+open file(allfile) stream output title(allname);
+
+put skip edit ('Opening file ',uldname) (a,a);
+open file(uldfile) stream output title(uldname);
+
+
+unused_buf_window.start = 1;
+unused_buf_window.len = 0;
+
+tab = byte(9);
+ff = byte(12);
+
+dt = date();
+current_date = substr(dt,5,2)       || '-' ||
+	months(bin(substr(dt,3,2))) || '-' ||
+	substr(dt,1,2);
+tt = time();
+current_time = substr(tt,1,2) || ':' ||
+	substr(tt,3,2)        || ':' ||
+	substr(tt,5,2);
+put skip;
+put edit('Current date: ',current_date,current_time) (a,x(1),a,x(1),a);
+put skip;
+
+no_mcr_time_stamp = true;
+mcr_time_stamp = '';
+adr_time_stamp = '';
+uld_time_stamp = '';
+ext_time_stamp = '';
+lnk_time_stamp = '';
+lnk_file_stamp = 'none';
+
+global_seen = false;
+is_ext = false;
+
+hash_anchor = null; 
+
+pending_labels = null;
+pending_constraints = null;
+action_list = null;
+do i=0 to 99; field(i).start = 1; field(i).len = 0; end;
+
+do i=0 to 255; is_decchar(i)='0'b; end;
+do i=rank('0') to rank('9'); is_decchar(i)='1'b; end;
+
+do i=0 to 255; is_hexchar(i) = false; hextable(i) = 0; end;
+do i=rank('0') to rank('9'); is_hexchar(i) = true; hextable(i) = i - rank('0'); end;
+do i=rank('A') to rank('F'); is_hexchar(i) = true; hextable(i) = 10 + i - rank('A'); end;
+do i=rank('a') to rank('f'); is_hexchar(i) = true; hextable(i) = 10 + i - rank('a'); end;
+
+bittable(0)='0000'b; bittable(1)='0001'b; bittable(2)='0010'b; bittable(3)='0011'b;
+bittable(4)='0100'b; bittable(5)='0101'b; bittable(6)='0110'b; bittable(7)='0111'b;
+bittable(8) ='1000'b; bittable(9) ='1001'b; bittable(10)='1010'b; bittable(11)='1011'b;
+bittable(12)='1100'b; bittable(13)='1101'b; bittable(14)='1110'b; bittable(15)='1111'b;
+
+starts_name_str	= from_lower || to_upper || '%$*';
+starts_numb_str	= '0123456789';
+starts_name_or_numb_str	= starts_name_str || starts_numb_str;
+in_name_str	= starts_name_or_numb_str || '._';
+
+do i=0 to 255; starts_name(i) = false; starts_name_or_numb(i) = false;
+    in_name(i) = false; end;
+do i=1 to length(starts_name_str);
+    starts_name(rank(substr(starts_name_str,i,1))) = true; end;
+do i=1 to length(starts_name_or_numb_str);
+    starts_name_or_numb(rank(substr(starts_name_or_numb_str,i,1))) = true; end;
+do i=1 to length(in_name_str);
+    in_name(rank(substr(in_name_str,i,1))) = true; end;
+
+do i=0 to 255; token_type_tbl(i) = t_other; end;
+do i=1 to length(starts_name_str);
+    token_type_tbl(rank(substr(starts_name_str,i,1))) = t_name; end;
+do i=1 to length(starts_numb_str);
+    token_type_tbl(rank(substr(starts_numb_str,i,1))) = t_numb; end;
+token_type_tbl(rank('(')) = t_lpar;
+token_type_tbl(rank(')')) = t_rpar;
+token_type_tbl(rank('+')) = t_plusm;
+token_type_tbl(rank('-')) = t_plusm;
+token_type_tbl(rank(',')) = t_comma;
+/* t_eoln handled in proc token_type */
+
+name_stack(0) = '_TOP_';
+line_stack(0) = 0;
+name_stack_ptr = 1;			/* first unused location */
+
+parity_type = BIT(odd_parity,1);	/* default to using odd parity */
+
+use_parity = true;  		/* default is to calculate parity */
+
+if index(debug,'Y')^=0
+THEN	use_address = true;
+ELSE	use_address = false;		/* is not use address in parity calc */
+
+identity_msg_count = 0;
+
+CALL init_byte_parity(0,256,0);
+IF INDEX(debug,'X')^=0 THEN
+	DO i=0 to 255; if mod(i,64)=0 then put skip;
+	put edit(byte_parity(i))(f(1)); END;
+ALLOCATE trix_t SET(trixp);			/* for fast parity calc. */
+
+
+put file(uldfile) edit('; <<< ALLOCATED '||current_date||' '||current_time) (a);
+put file(uldfile) skip;
+
+call read_pattern_file;
+
+call read_adr_file;
+
+call read_ext_file;
+
+IF link_name^='' THEN
+	CALL read_link_file;
+
+end; /* prologue */
+
+
+putwindow : proc (w,c);
+	/* show the window on  */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl c char(1);
+	dcl i fixed bin(31);
+
+	do i=1 to w.start-1;
+	    put  edit(' ') (a);
+	end;
+	do i=1 to w.len;
+	    put  edit(c) (a);
+	end;
+	put  skip;
+end; /* putwindow */
+
+
+read_adr_file : proc;
+	/* read in the adr file */
+
+	dcl ol	fixed bin;	/* old address */
+	dcl ln  fixed bin; 	/* line number */
+	dcl pg  fixed bin;	/* page number */
+	dcl nw  fixed bin;	/* new address */
+	dcl first_adr_line char(150) var; /* temporary for procesing first .ADR line */
+	dcl adr_eof bit(1) ALIGNED; 
+		   
+	put skip edit ('Opening file ',adrname) (a,a);
+	open file(adrfile) stream input title(adrname);
+
+	adr_eof = false;
+	on endfile(adrfile) adr_eof = true;
+
+	get file(adrfile) edit( first_adr_line )(A(132));
+	adr_time_stamp = SUBSTR( first_adr_line, adr_date_col, 18 );
+
+	DO ol = 0 TO max_addr;
+		adr(ol).line = unknown;
+		adr(ol).new  = unknown;
+		adr(ol).page = unknown;
+	END;
+
+	do while (^adr_eof);
+		get file(adrfile) list(ol, ln, pg, nw);
+		IF (0<= ol) & (ol<max_addr) THEN 
+		   do;
+			adr(ol).line = ln;	/* load the line number */
+			adr(ol).new  = nw;	/* load the new address */
+			adr(nw).page = pg;	/* load the page number for NEW addr */
+		   end; /* do then ol < max_addr */
+		ELSE
+			CALL error_msg('Address too big. IGNORED. ',
+				hex_char(ol,6));
+	end;   /* do while */
+
+	put skip edit('Closing file ', adrname) (a,a);
+	close file(adrfile);
+	put skip;
+
+end; /* read_adr_file */
+
+
+get_hex4 : PROC(c4) RETURNS(FIXED BIN(31));
+	/* Converts 4 hex chars to integer */
+	DCL c4 CHAR(4);
+	DCL n FIXED BIN(31);
+	DCL (i,j) FIXED BIN(31);
+	DCL c CHAR(1);
+
+	n = 0;
+	DO i= 1 TO 4;
+		c = SUBSTR(c4,i,1);
+		IF      '0'<=c & c<='9' THEN n = n*16 + RANK(c)-RANK('0');
+		ELSE IF 'A'<=c & c<='F' THEN N = N*16 + RANK(c)-RANK('A')+10;
+		ELSE IF 'a'<=c & c<='f' THEN N = N*16 + RANK(c)-RANK('a')+10;
+	END;
+	RETURN(n);
+END get_hex4;
+
+put_hex4 : PROC(n) RETURNS(CHAR(4));
+	/* Converts integer to 4 hex chars */
+	DCL c4 CHAR(4);
+	DCL n FIXED BIN(31);
+	DCL (i,k) FIXED BIN(31);
+
+	k = n;
+	DO i= 4 TO 1 BY -1;
+		SUBSTR(c4,i,1) = hex_table(MOD(k,16));
+		k = DIVIDE(k,16,31,0);
+	END;
+	RETURN(c4);
+END put_hex4;
+
+
+read_ext_file : proc;
+	/* read in the ext file */
+
+	dcl ext_line char(150) var;
+	dcl ext_eof bit(1) ALIGNED; 
+	DCL (acr_addr,mcr_addr) FIXED BIN(31);
+
+	put skip edit ('Opening file ',extname) (a,a);
+	open file(extfile) stream input title(extname);
+
+	ext_eof = false;
+	on endfile(extfile) ext_eof = true;
+
+	get file(extfile) edit( ext_line )(A(132));
+	ext_time_stamp = SUBSTR( ext_line, ext_date_col, 18 );
+
+/*
+; 30-JUN-82 15:46:35
+;= GBL 213E B..	
+;= EXT 15DC C..3
+
+Comes in with .MCR address. Write out into .U40 with .ACR address
+LATER -- delete duplicate/resloved entries
+
+*/
+
+	DO WHILE (^ext_eof);
+	    GET FILE(extfile) EDIT( ext_line )(A(132));
+	    IF LENGTH(ext_line)>12 THEN
+		IF SUBSTR(ext_line,1,2)=';=' THEN
+		    DO;
+			mcr_addr = get_hex4(SUBSTR(ext_line,8,4));
+			acr_addr = adr(mcr_addr).new;
+			SUBSTR(ext_line,8,4) = put_hex4(acr_addr);
+			PUT FILE(uldfile) EDIT(ext_line) (A);
+			PUT FILE(uldfile) SKIP;
+			IF SUBSTR(ext_line,4,3)='EXT' THEN
+				is_ext(mcr_addr) = true;
+			IF SUBSTR(ext_line,4,3)='GBL' THEN
+				global_seen(acr_addr) = true;
+		    END;
+	END;   /* do while */
+
+	put skip edit('Closing file ', extname) (a,a);
+	close file(extfile);
+	put skip;
+
+end; /* read_ext_file */
+
+
+read_link_file : PROC;
+	/* read in previous .U40 file */
+	DCL lnk_line CHAR(255) VAR;
+	DCL lnk_eof bit(1) ALIGNED; 
+	DCL (acr_addr,mcr_addr) FIXED BIN(31);
+
+/*
+; <<< ALLOCATED 14-Jun-82 08:15:03	    (1)
+;= GBL 213E B..				\
+;= EXT 15DC C..3			/   (1.5)
+; <<< ALLOCATED 10-Jun-82 16:53:21	\
+;= EXT 1029 A..1			|
+;= GBL 15DC C..				|
+;      TST.ULD		     MICRO2  1M(01)    10-JUN-82  14:38:01
+;RADIX 16				|
+;RTOL					|
+[15DC]=3462783160			|
+[15DD]=D500097029			|
+[15DE]=B202FAE2A0			|
+[1029]=6180178D31			|
+ ...					|
+[1000]I=0009D10060907			 \
+[0000]I=0006F53FE2904			  > (2) from old linked file
+[0001]I=0004F52AE2904			 /
+ ...					|
+[017C]I=1780010000100			|
+[7FFF]=0006101438		timestamp
+; ALLOCATED 10-Jun-82 16:53:21 >>> 	/
+;      TST.ULD		     MICRO2  1M(01)    14-JUN-82  08:11:27
+;RADIX 16				|
+;RTOL					|
+[213E]=xxxxxxxxxx			\
+[213F]=xxxxxxxxxx			 > (3) from new linked file
+[2140]=xxxxxxxxxx			/
+[7FFF]=0006140811		timestamp  (4)
+; ALLOCATED 14-Jun-82 08:15:03 >>> 	   (5)
+FIELD A=<41:38>				\
+ A=0A					|
+ AP=0C					|
+  ...					|
+ ZERO=8					 > (6) from new linked file
+FIELD A.DP=<41:38>			|
+ A=0A					|
+ AP=0C					|
+ ATDL=0B				/
+
+*/
+	IF INDEX(link_name,'.')=0 THEN
+		link_name = link_name || '.U40';
+	put skip edit ('Opening file ',link_name) (a,a);
+	open file(linkfile) stream input title(link_name);
+
+	lnk_eof = false;
+	on endfile(linkfile) lnk_eof = true;
+
+	DO WHILE (^lnk_eof);
+	    GET FILE(linkfile) EDIT( lnk_line )(A(132));
+	    CALL untab(lnk_line);
+	    IF LENGTH(lnk_line)>=66 THEN
+		IF SUBSTR(lnk_line,uld_micro_col,6)='MICRO2' THEN
+		    DO;
+			lnk_time_stamp = SUBSTR(lnk_line,uld_date_col,10) ||
+		     		SUBSTR(lnk_line,uld_time_col,8);
+			lnk_file_stamp = SUBSTR(lnk_line,uld_file_col,13);
+		    END;
+	    IF LENGTH(lnk_line)>=12 THEN
+		IF SUBSTR(lnk_line,1,5)=';= GBL' THEN
+		    DO;
+			acr_addr = get_hex4(SUBSTR(lnk_line,8,4));
+			global_seen(acr_addr) = true;
+		    END;
+		ELSE IF SUBSTR(lnk_line,1,1)='[' THEN
+		    DO;
+			acr_addr = get_hex4(SUBSTR(lnk_line,2,4));
+			IF adr(acr_addr).page=unknown THEN
+				adr(acr_addr).page = extrn;
+		    END;
+	    PUT FILE(uldfile) EDIT(lnk_line) (A);
+	    PUT FILE(uldfile) SKIP;
+	END;   /* do while */
+
+	put skip edit('Closing file ', link_name) (a,a);
+	close file(linkfile);
+	put skip;
+
+END read_link_file;
+
+
+read_next_line : proc(form_feed, read_file) returns(bit(1) ALIGNED);
+	/* supply the next input line, if any, all broken up */
+	/* return true if no more input */
+	/* if a form feed begins the line, set Form_feed to true */
+
+	dcl read_file	file	variable;
+	dcl form_feed 	bit(1) ALIGNED;
+	dcl i 		fixed 	bin(31);
+
+	form_feed = false;
+	on endfile(read_file) eof = true;
+	if ^eof then
+		read file(read_file) into(buf);
+	else 
+		return (true);
+	call untab(buf);
+	buf_window.start = 1;
+	buf_window.len   = length(buf);
+
+	IF wchar(buf_window)=ff THEN
+	    DO;
+		CALL split(buf_window,2,unused_buf_window,buf_window);
+		form_feed = true;		
+	    END;
+
+	return(false);
+
+end; /* read_next_line */
+
+
+read_pattern_file : proc;
+	/* read patteerns in from a file */
+	dcl i fixed bin(31);
+	dcl xinfile file;
+
+	put skip list('Opening file "ALLOC3$PAT"');
+	open file(xinfile) title('ALLOC3$PAT') record input;
+	on endfile(xinfile) goto eof_label;
+	read file(xinfile) into(buf);
+
+	do while (buf^='/');
+		p = extract_pattern(buf);
+		if p^=null then
+		    do;
+			i = p->bitpat.action_number;
+			if i < 100 then
+				call find_field(p,field(i));
+			else
+				call enqueue(action_list,p);	/* build backwards list */
+		    end;
+		read file(xinfile) into(buf);
+	end; /* do */
+eof_label:
+	put skip list('Closing file "ALLOC3.PAT"');
+	close file(xinfile);
+	call reverse(action_list);
+end; /* read_pattern_file */
+
+
+replace_buf : proc( ucode_string );
+	/* replace the old Uword characters in 'buf' with */
+	/* the new uaddress, 'ucode_string' of characters */
+	/* m aaaa  uuuu,uuuu,uu  */
+
+	dcl ucode_string    	bit(128) ALIGNED;
+	dcl uadr 		fixed bin(31);
+	dcl final_ucode_char 	char(40) var;
+	dcl uadd_string     	bit(31) ALIGNED;
+	dcl long_string		bit(128) ALIGNED;
+
+	uadd_string = bit(0); 	/* zero out the microaddress string */
+	uadr	 = get_adr(current_uaddr); 
+
+	substr( buf, field(54).start, field(54).len ) = ' '; /* clear the buffer */
+
+
+	/* put the new address to the BUF */
+
+	uadd_string = mybit(uadr,16); /* convert and align the address */
+				      /* get 16 bits (4 full hex characters) */
+	substr(long_string, 1, 31 ) = uadd_string;
+
+	substr( buf, field(55).start, field(55).len ) = 
+		hex_string( long_string, field(55).len, 0, '');
+
+	final_ucode_char =
+		hex_string( ucode_string, field(62).len, field(61).len, ',');
+
+	IF (field(56).len < LENGTH( final_ucode_char) )
+	THEN	CALL error_msg('uWord written is longer than ','expected from pattern file #56');
+		
+	SUBSTR(buf, field(56).start, length(final_ucode_char)) = final_ucode_char;
+
+end; /* replace_buf */
+
+replace_buf_uld : proc(new_ubits);
+	/* build a new uld line 			*/
+	/* replace the uld line in BUF with a new line  */
+	/* from ucode_char				*/
+
+	dcl new_ubits		bit(128) ALIGNED;
+	dcl ucode_char	    	char(100) var;
+	dcl buf_uadd_start 	fixed bin(31);
+	dcl buf_uadd_len 	fixed bin(31);
+	dcl ucode_len 		fixed bin(31);
+	dcl uadr 		fixed bin(31);
+	dcl final_ucode_char 	char(40) var;
+	dcl uadd_string     	bit(128) ALIGNED;
+	dcl long_string		bit(128) ALIGNED;
+
+	ucode_len    = 10;	/* ten hex digits */
+	buf_uadd_len = 4;	/* four characters of address */
+	uadr	 = get_adr(current_uaddr); 
+	uadd_string = bit(0); 	/* zero out the microaddress string */
+
+	ucode_char	= '';	/* clean out the previous uld line */
+	
+	/* put the new address to the uld UCODE_CHAR */
+
+	uadd_string = mybit(uadr,16); /* convert and align the address */
+				      /* get 16 bits (4 full hex characters) */
+
+	substr( long_string, 1, 31) = uadd_string;
+
+	ucode_char = '['||hex_string( long_string, buf_uadd_len, 0, '')||']';
+
+	if current_umem ^= 'U' then ucode_char = ucode_char||current_umem;
+
+	ucode_char = ucode_char||'=';
+
+	final_ucode_char = hex_string( new_ubits, ucode_len, 0,'');
+
+	ucode_char = ucode_char||final_ucode_char;
+
+	buf = '';		/* init the buf    */
+	buf = ucode_char;	/* update the buf! */
+
+end; /* replace_buf_uldline */
+
+
+retab : proc(s);
+	/* Replaces blanks in string s with tabs. Tab = cols 8n+1. */
+	/* Also removes trailing blanks. */
+	dcl s char(135) var;
+	dcl (i,j,k,l,m,mlen) fixed bin(31);
+
+	%replace min_tab by 0;
+
+floor8 : proc(i) returns(fixed bin(31));
+	/* floor k*8+1 */
+	dcl i fixed bin(31);
+	return(divide(i-1,8,31,0)*8+1);	/* 8->1, 9->9, 10->9 */
+end; /* floor8 */
+
+ceil8 : proc(i) returns(fixed bin(31));
+	/* ceil k*8+1 */
+	dcl i fixed bin(31);
+	return(divide(i+6,8,31,0)*8+1);	/* 8->9, 9->9, 10->17 */
+end; /* ceil8 */
+
+/*
+		MIN_TAB
+	don't tab|	   m = 8*k+1	       i
+	/-------\|	   |		       |	
+	-----------------------------------------
+    s:	|part not retabbed| part retabbed	|
+	-----------------------------------------
+			<---- algorithm moves this way.
+*/
+
+
+	l = length(s);
+	do while( (l>0) & (substr(s,l,1)=' ') ); l = l-1; end;	/* trailing blanks */
+	mlen = l - floor8(l) + 1;			/* length of retabbed part */
+	do m = floor8(l) to ceil8(min_tab)+8 by -8;
+		/* decide whether to tab for [m-8..m-1] */
+		j = m-9;
+		do i = m-8 to m-1; if substr(s,i,1)^=' ' then j=i; end;
+		/* j is last non-blank in that interval */
+		if (m-j-1)>=2 then /* at least two blanks -- tab */
+		    do;
+			substr(s,j+1,1) = tab;
+			substr(s,j+2,mlen) = substr(s,m,mlen);
+			mlen = mlen - (m-j-1) + 1;	/* out m-j-1 blanks, in 1 tab */
+		    end;
+		mlen = mlen + 8;
+	end; /* do m */
+	s = substr(s,1,mlen);
+end; /* retab */
+
+
+reverse : proc(anch);
+	/* reverse single-linked cdr list */
+	dcl anch ptr;
+	dcl (p,q,r) ptr;
+
+	q = null;
+	p = anch;
+	do while(p^=null);
+		r = p;			/* r = elem to change    */
+		p = p->cons.cdr;	/* p = unchanged sublist */
+		r->cons.cdr = q;	/* q = reversed sublist  */
+		q = r;
+	end;
+	anch = q;
+end; /* reverse */
+
+
+skip_blanks : proc(w);
+	/* skip over leading blanks. UPDATE w			*/
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 trash_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl i fixed bin(31);
+
+	i = verify(substr(buf,w.start,w.len), ' ');
+	if i=0 then i = w.len+1;
+	call split(w,i,trash_w,w);
+end; /* skip_blanks */
+
+
+
+split : proc(in_w,k,left_w,right_w);
+	/* split the incoming window into two pieces, 1..k-1, and k..len */
+	/* works in all degenerate cases */
+	dcl 1 in_w,    2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 left_w,  2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 right_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl k fixed bin(31);
+	dcl 1 local_w,    2 start fixed bin(31), 2 len fixed bin(31);
+	dcl local_k fixed bin(31);
+
+	local_w = in_w;
+	local_k = k;
+	if local_k<1 then local_k = 1;			/* make out of bounds */
+	if in_w.len<local_k then local_k = in_w.len+1;	/*  work.	      */
+
+	right_w.start = local_w.start+(local_k-1);
+	right_w.len   = local_w.len-(local_k-1);
+	left_w.start = local_w.start;
+	left_w.len   = local_k-1;
+end; /* split */
+
+
+stack_begins_ends : PROC( w );
+	/* stack the begins and unstack the ends */
+	/* name_stack_ptr points to first UNUSED stack slot */
+
+	DCL uppercase_buf 	char(255) var;
+	DCL 1 w, 
+		2 start FIXED BIN(31),
+		2 len FIXED BIN(31);
+	DCL 1 w1, 
+		2 start FIXED BIN(31),
+		2 len FIXED BIN(31);
+	DCL 1 w2, 
+		2 start FIXED BIN(31),
+		2 len FIXED BIN(31);
+	DCL 1 toke, 
+		2 start FIXED BIN(31),
+		2 len FIXED BIN(31);
+	DCL s	CHAR(40) VAR;
+	DCL t	FIXED BIN(31);
+	DCL j	FIXED BIN(31);
+	DCL i	FIXED BIN(31);
+
+
+t = windex( w, ';=' );
+
+IF t<=w.len THEN
+	DO;
+
+	CALL SPLIT( w, t+2, w1, w2 );
+	CALL token( w2, toke );
+	s = wcont( toke );
+	s = TRANSLATE( s, to_upper, from_lower );
+	IF s = 'BEGIN'
+	THEN	DO;
+		CALL token( w2, toke);		/* get the name */
+
+		s = wcont(toke);
+		name_stack(name_stack_ptr) = s;
+		line_stack(name_stack_ptr) = current_lineno;
+		IF name_stack_ptr<15 
+		THEN	name_stack_ptr = name_stack_ptr + 1;
+		ELSE	CALL error_msg(' too many BEGINS. Error mess. ', 'on ENDs will occur');
+
+
+		END; /* found a BEGIN */
+	ELSE DO; /* s^= BEGIN */
+		
+		IF s = 'END'
+		THEN	DO;
+			CALL token( w2, toke);		/* get the name */
+
+			s = wcont(toke);
+
+			IF name_stack_ptr>1
+			THEN	name_stack_ptr = name_stack_ptr - 1;
+			ELSE	CALL error_msg('Too many ends.', '');
+
+			IF ( s ^= name_stack(name_stack_ptr) )
+			THEN	DO;
+				CALL error_msg ( 'END mismatches: ', 
+						name_stack(name_stack_ptr) );
+				END; /* end name not equal stack top */
+
+			END; /* END was found */
+		END; /* end of else */
+	END; /* a ;= was found */
+
+END; /* stack_begins_ends */
+
+
+stack_line : PROC  RETURNS( CHAR(132) );
+	/* put the stack into an output line */
+	/* name_stack_ptr points to first UNUSED stack slot */
+	/* slot 0 is outside of all begins */
+
+	DCL line	CHAR(132);	/* the character line */
+	DCL (i,j,k) FIXED BIN(31);
+	
+	line = ';';			/* blank padded */
+	j = 132;			/* first char in col 131 */
+	DO i = 1 TO name_stack_ptr-1;
+		k = MIN(LENGTH(name_stack(i)),begin_name_size);
+		SUBSTR(line,j-k,k) = SUBSTR(name_stack(i),1,k);
+		j = j-k-1;		/* blank in front of name */
+	END;
+
+	RETURN( line );
+END; /* stack_line */
+
+
+token : proc(w,t_w);
+	/* extract the next token from w. UPDATE w.			*/
+	/* return t_w enclosing the token.				*/
+	/* a token is:
+		a name, containing A-Z,a-z,0-9, "._%$*", or
+		a number(hex), containing 0-9,a-z,A-Z, or
+		an alignlist, containing 01*, or
+		a SINGLE punctuation character				*/
+	/* leading blanks are ignored					*/
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 t_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl i fixed bin(31);
+
+if index(debug,'T')^=0 then
+do; put  edit('before TOKEN: "',substr(buf,w.start,w.len),'"')
+(a,a,a); put  skip; end;
+	call skip_blanks(w);
+	if (w.len>0) then
+	    do;
+		if starts_name_or_numb(rank(wchar(w))) then
+		    do;	/* name or number */
+			i = wverify(w,in_name_str);	/* to first non-name char */
+			call split(w,i,t_w,w);		/* pull out word */
+		    end;
+		else
+		    do;
+			call split(w,2,t_w,w);		/* pull out one char */
+		    end;
+	    end;
+	else
+	    t_w = w;	/* both empty */
+if index(debug,'T')^=0 then
+do; put  edit('after TOKEN: "',substr(buf,w.start,w.len),'"')
+(a,a,a); put  skip; end;
+end; /* token */
+
+
+token_type : proc(w) returns(fixed bin(31));
+	/* map token in w to small integer */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	if w.len>0 then
+	    return( token_type_tbl(rank(wchar(w))) );
+	else;
+	    return( t_eoln );
+end; /* token_type */
+
+
+u_action : proc( n, new_ubits, exit_actions, page_print);
+	/* do action number n */
+
+	dcl n fixed bin (31);		/* input */
+	dcl exit_actions bit(1) ALIGNED;	/* output */
+	dcl new_ubits bit(128) ALIGNED;		/* input, modified */
+	dcl page_print bit(1) ALIGNED;		/* input for putting pages */
+
+	dcl temp_ubits bit(128) ALIGNED;
+	dcl target_add fixed bin (31);
+	dcl line_num fixed bin (31);
+	dcl offset     fixed bin (31);
+	dcl off        fixed bin (br_off_len);
+	dcl adr_index  fixed bin (31);
+	dcl setup_string bit(31) ALIGNED;
+	dcl page_part fixed bin(page_no_len);
+	dcl page_offset_part fixed bin(jump_disp_len);
+	dcl page_source fixed bin(31);
+	dcl page_target fixed bin(31);
+	dcl adr_false_index fixed bin(31);
+	dcl false_add	fixed bin(31);
+	dcl page_false	fixed bin(31);
+	dcl page_true	fixed bin(31);
+
+	exit_actions = true;
+ 
+	adr_index  = bin( SUBSTR(current_ubits,field(2).start, field(2).len ));
+	adr_false_index = bin( SUBSTR( current_ubits,field(3).start, 
+					       field(3).len ));
+	source_add = get_adr(current_uaddr);
+
+	if (101<=n) & (n<=120) then goto l(n);
+
+l(101): 	/* reverse true, false */
+	DO;
+		SUBSTR(temp_ubits, field(2).start, field(2).len ) =
+			SUBSTR( current_ubits, field(2).start, field(2).len);
+		SUBSTR(current_ubits, field(2).start, field(2).len ) =
+			SUBSTR( current_ubits, field(3).start, field(3).len);
+		SUBSTR(current_ubits, field(3).start, field(3).len ) =
+			SUBSTR( temp_ubits, field(2).start, field(2).len);
+		exit_actions = false;
+		RETURN;
+	END;
+
+
+l(102):	DO;	/* branch offset calculation			 */
+		/* use  the new addresses to calculate the       */
+		/* branch offset.  Load the offset               */
+		/* If is within the +64 -63 range                */
+		/* ( -64 <= offset <= 63) then return;           */
+		/*  else log an error and return                 */
+
+		IF true_label THEN
+		    DO;
+			target_add = get_adr( adr_index );
+			offset     = target_add - (source_add + 1);	/* signed */
+			IF offset<0 THEN off = offset + 128;		/* unsigned */
+				    ELSE off = offset;
+			IF ^((-64 <= offset) & ( offset <= +63 )) THEN
+				CALL error_msg( 'Offset TRUNCATED. ', hex_char(offset,6));
+			SUBSTR(new_ubits, br_off_start, br_off_len ) =
+				BIT(off,br_off_len);
+			page_true_char = get_pageno(target_add,false,debug_a);
+			target_add_char = hex_char( target_add,4 );
+		    END; /* true_label */
+		IF false_label THEN 
+		    DO;
+			false_add  = get_adr( adr_false_index);
+			IF (false_add ^= source_add+1) THEN
+				CALL error_msg('Fall-thru not address+1.', '');
+			page_false_char = get_pageno(false_add,false,debug_a);
+			false_add_char  = hex_char( false_add,4 );
+
+		    END; /* false_label */
+		RETURN;
+	END;	/* (102) true label branch offset calculation */
+
+		
+l(103): DO;	/* broad jump/call */
+		target_add = get_adr( adr_index );
+		page_part  = page(target_add);
+		page_offset_part = page_offset(target_add);
+
+		SUBSTR(new_ubits,jump_disp_start,jump_disp_len) =
+			BIT(page_offset_part,jump_disp_len);
+		SUBSTR(new_ubits,page_no_start,page_no_len) =
+			BIT(page_part,page_no_len);
+		page_true_char = get_pageno(target_add,false,debug_a);
+		target_add_char = hex_char( target_add,4 );
+		IF false_label THEN
+		    DO;
+			false_add  = get_adr( adr_false_index);
+			IF (false_add ^= source_add+1) THEN
+				CALL error_msg('Return not address+1.', '');
+			page_false_char = get_pageno(false_add,false,debug_a);
+			false_add_char = hex_char( false_add,4);
+		    END;
+		RETURN;
+	END; /* (103) broad jump/call */
+
+
+l(104):
+	IF has_misc_field THEN 
+	    DO;	/* page 7 jump                      */
+		/* load page offset into jump field */
+
+		target_add = get_adr( adr_index );
+		page_offset_part = page_offset(target_add);
+
+		IF ^in_four_k( 30000, target_add ) THEN
+			CALL error_msg('Target not on page 7.','');
+		SUBSTR(new_ubits,jump_disp_start,jump_disp_len) =
+			BIT(page_offset_part,jump_disp_len);
+		page_true_char = get_pageno(target_add,false,debug_a);
+		target_add_char = hex_char( target_add,4 );
+	    END;
+	ELSE
+	    exit_actions = false;
+	RETURN;
+
+l(105):
+	DO; 	/* jump, call, not long jump         */
+		/* load new address in to jump field */
+		/* verify within 4 k page            */
+		/* test for in same 4k block, carefull, the hardware    */
+		/* lets us jump across block boundaries when address is */
+		/* exactly at a 4k boundary .                           */
+		/* the current addres is in adr of 'current_uaddr'      */
+		/* the target address is in adr target true address     */
+
+		target_add = get_adr( adr_index );
+		page_offset_part = page_offset(target_add);
+
+		IF ^in_four_k( source_add+1, target_add ) THEN
+			CALL error_msg('Target not in same 4K block as ', 'source+1');
+		SUBSTR(new_ubits,jump_disp_start,jump_disp_len) =
+			BIT(page_offset_part,jump_disp_len);
+		page_true_char = get_pageno(target_add,false,debug_a);
+		target_add_char = hex_char( target_add,4 );
+		IF false_label THEN
+		    DO;
+			false_add  = get_adr( adr_false_index);
+			IF (false_add ^= source_add+1) THEN
+				CALL error_msg('Return not address+1.', '');
+			page_false_char = get_pageno(false_add,false,debug_a);
+			false_add_char = hex_char( false_add,4);
+		    END;
+		RETURN;
+	END; /* 105 jump, call, not long jump */
+
+
+l(106):
+	DO;	/* e-return */
+		IF adr_index<16384 THEN offset = adr_index;	/* signed */
+				   ELSE offset = adr_index - 32768;
+		IF offset<0 THEN off = offset + 128;		/* unsigned */
+			    ELSE off = offset;
+		IF ^((-64 <= offset) & ( offset <= +63 )) THEN
+			CALL error_msg( 'Offset TRUNCATED. ', hex_char(offset,6));
+		SUBSTR(new_ubits, br_off_start, br_off_len ) =
+			BIT(off,br_off_len);
+		page_true_char = '     ';
+		target_add_char = 'ERET';
+		RETURN;
+	END; /* (106) e-return */
+
+
+l(107):
+	DO;	/* F-ROM jump to page 0 */
+		/* load page offset into jump field */
+
+		target_add = get_adr( adr_index );
+		page_offset_part = page_offset(target_add);
+
+		IF ^in_four_k( 0, target_add ) THEN
+			CALL error_msg('Target not on page 0.','');
+		SUBSTR(new_ubits,jump_disp_start,jump_disp_len) =
+			BIT(page_offset_part,jump_disp_len);
+		page_true_char = get_pageno(target_add,false,debug_a);
+		target_add_char = hex_char( target_add,4 );
+		RETURN;
+	END;	/* (107) F-ROM jump to page 0 */
+
+l(108): ;
+l(109): ;
+	RETURN;
+
+l(110):	DO;	/* no true label */
+	true_label = false;
+	exit_actions = false;
+	RETURN;
+	END; /* no true label */
+
+l(111):	DO;	/* no false label */
+	false_label = false;
+	exit_actions = false;
+	RETURN;
+	END; /* no false label */
+
+l(112):	DO;  	/* no MISC field 				*/
+		/* this class of instruction has no MISC field	*/
+	exit_actions = false;
+	has_misc_field = false;
+	RETURN;
+	END; /* (112) no MISC field */
+
+l(113): 
+	DO;	/* RET, goto	*/
+		IF adr_index<16384 THEN offset = adr_index;	/* signed */
+				   ELSE offset = adr_index - 32768;
+		IF offset<0 THEN off = offset + 128;		/* unsigned */
+			    ELSE off = offset;
+		IF ^((-64 <= offset) & ( offset <= +63 )) THEN
+			CALL error_msg( 'Offset TRUNCATED. ', hex_char(offset,6));
+		SUBSTR(new_ubits, br_off_start, br_off_len ) =
+			BIT(off,br_off_len);
+		page_true_char = '     ';
+		target_add_char = 'RET ';
+		IF false_label THEN
+		    DO;
+			false_add  = get_adr( adr_false_index);
+			IF (false_add ^= source_add+1) THEN
+				CALL error_msg('Return not address+1.', '');
+			page_false_char = get_pageno(false_add,false,debug_a);
+			false_add_char = hex_char( false_add,4);
+		    END;
+		RETURN;
+	END;	/* (113) RET, goto */
+
+l(114): 
+	DO;	/* IID, goto	*/
+		page_true_char = '     ';
+		target_add_char = 'IID ';
+		IF true_label THEN
+		    DO;
+			target_add = get_adr( adr_index );
+			offset     = target_add - (source_add + 1);
+			IF offset<0 THEN off = offset + 128;
+				    ELSE off = offset;
+			IF ^((-64 <= offset) & ( offset <= +63 )) THEN
+				CALL error_msg( 'Offset TRUNCATED. ', hex_char(offset,6));
+			SUBSTR(new_ubits, br_off_start, br_off_len ) =
+				BIT(off,br_off_len);
+			page_false_char = get_pageno(target_add,false,debug_a);
+			false_add_char = hex_char( target_add,4 );
+		    END; /* true_label */
+		RETURN;
+	END;	/* (114) IID, goto */
+
+l(115):
+	DO;	/* goto, IID */
+		target_add = get_adr( adr_index );
+		offset     = target_add - (source_add + 1);
+		IF offset<0 THEN off = offset + 128;
+			    ELSE off = offset;
+		IF ^((-64 <= offset) & ( offset <= +63 )) THEN
+			CALL error_msg( 'Offset TRUNCATED. ', hex_char(offset,6));
+		SUBSTR(new_ubits, br_off_start, br_off_len ) =
+			BIT(off,br_off_len);
+		page_true_char = get_pageno(target_add,false,debug_a);
+		target_add_char = hex_char( target_add,4 );
+		page_false_char = '     ';
+		false_add_char  = 'IID ';
+		RETURN;
+	END;	/* (115) goto, IID */
+
+l(116): 
+	DO;	/* NSD, goto	*/
+		page_true_char = '     ';
+		target_add_char = 'NSD ';
+		IF true_label THEN
+		    DO;
+			target_add = get_adr( adr_index );
+			offset     = target_add - (source_add + 1);
+			IF offset<0 THEN off = offset + 128;
+				    ELSE off = offset;
+			IF ^((-64 <= offset) & ( offset <= +63 )) THEN
+				CALL error_msg( 'Offset TRUNCATED. ', hex_char(offset,6));
+			SUBSTR(new_ubits, br_off_start, br_off_len ) =
+				BIT(off,br_off_len);
+			page_false_char = get_pageno(target_add,false,debug_a);
+			false_add_char = hex_char( target_add,4 );
+		    END; /* true_label */
+		RETURN;
+	END;	/* (116) NSD, goto */
+
+l(117): 
+	DO;	/* RET(0), goto	*/
+		page_true_char = '     ';
+		target_add_char = 'RET ';
+		target_add = get_adr( adr_index );
+		offset     = target_add - (source_add + 1);
+		IF offset<0 THEN off = offset + 128;
+			    ELSE off = offset;
+		IF ^((-64 <= offset) & ( offset <= +63 )) THEN
+			CALL error_msg( 'Offset TRUNCATED. ', hex_char(offset,6));
+		SUBSTR(new_ubits, br_off_start, br_off_len ) =
+			BIT(off,br_off_len);
+		page_false_char = get_pageno(target_add,false,debug_a);
+		false_add_char = hex_char( target_add,4 );
+		RETURN;
+	END;	/* (117) RET(0), goto */
+
+l(118):
+	DO;	/* jsr f-box */
+		page_true_char = '     ';
+		target_add_char = 'JSRF';
+		RETURN;
+	END; /* (118) jsr f-box */
+
+
+l(119): ;
+l(120): ;
+	RETURN;
+
+end; /* u_actions */
+
+
+in_four_k : proc(address_1, address_2) returns(bit(1) ALIGNED);
+	/* determine if the two addresses are in the same 4k block */
+
+	dcl address_1 fixed bin;
+	dcl address_2 fixed bin;
+
+	RETURN( divide(address_1,4096,31,0) = divide(address_2,4096,31,0) );
+
+end; /* in_four_k */
+
+page_offset : proc(number) returns( fixed bin(31) );
+	/* return the 4k page offset of the 'number' */
+
+	dcl number fixed bin(31);
+
+	RETURN( mod( number, 4096 ) );
+
+end; /* page_offset */
+
+page  : proc(number) returns( fixed bin(31) );
+	/* return the 4k page number of the 'number' */
+
+	dcl number fixed bin(31);
+
+	return( divide(number,4096,31,0) );
+
+end; /* page */
+	
+
+
+untab : proc(s);
+	/* Replaces tabs in string s with blanks. Tab = cols 8n+1 */
+	dcl s char(255) var;
+	dcl (i,j) fixed bin(31);
+
+	i = index(s,tab);
+	do while (i>0);
+		s = SUBSTR(s,1,i-1) ||
+			SUBSTR('        ',1,mod(8-i,8)+1) ||
+			SUBSTR(s,i+1);
+		i = index(s,tab);
+	end; /* do while */
+end; /* untab */
+
+
+
+wchar : proc(w) returns(char(1));
+	/* return first char in window */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	if w.len>0 then return(SUBSTR(buf,w.start,1));
+		   else return('?');
+end; /* wchar */
+
+
+wcont : proc(w) returns(char(255)var);
+	/* return contents of window */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	return(SUBSTR(buf,w.start,w.len));
+end; /* wcont */
+
+
+windex : proc(w,str) returns(fixed bin(31));
+	/* index string str in window w */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl str char(255) var;
+	dcl i fixed bin(31);
+
+	i = index(wcont(w),str);
+	if i=0 then i = w.len+1;	/* put not found off the tail end */
+	return(i);
+end; /* windex */
+
+
+wverify : proc(w,str) returns(fixed bin(31));
+	/* verify string str in window w */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl str char(255) var;
+	dcl i fixed bin(31);
+
+	i = verify(wcont(w),str);
+	if i=0 then i = w.len+1;	/* put not found off the tail end */
+	return(i);
+end; /* wverify */
+
+
+write_line : proc(line,prev_ff,out_file);
+	/* write a single line or sub-line to the output file */
+	/* if prev_ff is true then add ff to front */
+
+	dcl line char(135) var;
+	dcl prev_ff bit(1) ALIGNED;
+	dcl out_file file;
+
+	CALL retab( line );
+
+	IF prev_ff THEN
+		PUT FILE(out_file) EDIT(ff) (A);
+	put file(out_file) edit(line) (a);
+	put file(out_file) skip; 
+end; /* write_line */
+
+
+write_one_line: proc(line,prev_ff,out_file);
+	/* buffer one line for writing */
+	/* write the previously buffered line */
+	/* if prev_ff is true then do not force a new line    */
+	/* after the sub-'line' is written */
+
+dcl line char(135) var;
+dcl out_file		file;
+dcl prev_ff bit(1) ALIGNED;
+/* dcl pre_line char(135) var; declared as global */
+/* dcl pre_line_valid bit(1) ALIGNED;	declared as global 'the prebuf is loaded' */
+/* dcl pre_prev_ff bit(1) ALIGNED; global */
+
+if pre_line_valid = true
+then	do;
+	call write_line(pre_line, pre_prev_ff, out_file);
+	end; /* then pre_line_valid */
+
+pre_line = line;
+pre_prev_ff = prev_ff;
+pre_line_valid = true;
+
+end; /* write_one_line */
+
+
+
+/*************************************/
+/************ main program ***********/
+/*************************************/
+
+CALL prologue;
+ON FIXEDOVERFLOW;		/* ignore fixedoverflow (in u_action w/errmsg) */
+
+write_stack = false;	/* safety */
+uld_next = 0;
+process_uld = false;
+print_file = allfile;
+read_file = infile;
+form_feed = false;
+do_listing = true;
+
+eof = false;
+ON ENDFILE(read_file) eof = true;
+
+PUT SKIP;
+PUT EDIT('Processing .MCR file...') (A);
+PUT SKIP;
+
+myeof = read_next_line(form_feed,read_file);
+DO WHILE (^myeof);
+
+	CALL process_one_line; 
+
+	out_put_line = SUBSTR(buf, buf_window.start, buf_window.len);
+
+	IF debug_s THEN
+	    DO;
+		IF ok_to_print(buf_window) THEN
+		    CALL write_one_line(out_put_line,false,allfile); 
+	    END;
+	ELSE
+		CALL write_one_line(out_put_line,form_feed,allfile); 
+
+	myeof = read_next_line(form_feed, read_file);
+
+END; /* do while */
+
+CALL write_one_line( ' ',false, allfile);  /* write the Last line */
+
+IF ^debug_s THEN
+	CALL print_xref;
+
+/* *************************************************************** */
+
+/* process the uld file */
+
+PUT SKIP;
+PUT EDIT('Processing .ULD file...') (A);
+PUT SKIP;
+
+form_feed = false;
+pre_line_valid = false;			/* empty ( reset) the buffer pipe  */
+process_uld = true;
+current_lineno = 0;			/* reset the line number count */
+u40_lineno = 0;
+uld_next = 0;
+print_file = uldfile;
+read_file = old_uldfile;
+
+eof = false;
+on endfile (read_file) eof = true;
+
+
+myeof = read_next_line(form_feed, read_file);
+uld_time_stamp = SUBSTR(buf,uld_date_col,10) ||
+		     SUBSTR(buf,uld_time_col,8);
+IF uld_time_stamp^=mcr_time_stamp THEN
+	CALL error_msg('ULD time stamp mismatch: ','"'||uld_time_stamp||'"');
+
+do while (^myeof);
+	current_lineno = current_lineno+1;/* count the .ULD lines starting with 1 */
+	u40_lineno     = u40_lineno+1;    /* count the .u40 lines starting with 1 */
+	call process_one_uldline;
+	out_put_line = buf;
+	IF INDEX(out_put_line,'MICRO2')^=0 THEN
+		CALL untab(out_put_line);
+
+	IF global_seen(adr(current_uaddr).new) & is_ext(current_uaddr) THEN
+		out_put_line = ';#### ' || out_put_line;
+	IF LENGTH(out_put_line)>0 THEN 
+	    IF SUBSTR(out_put_line,1,1)='[' | SUBSTR(out_put_line,1,1)=';' THEN
+		call write_line(out_put_line, form_feed, uldfile);
+	myeof = read_next_line(form_feed, read_file);
+end; /* do while */
+call write_one_line( ' ',false, uldfile);  /* write the Last line */
+
+call epilogue;
+
+end; /* alloc3 */

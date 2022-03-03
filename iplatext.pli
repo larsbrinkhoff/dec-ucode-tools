@@ -1,0 +1,197 @@
+
+/*
+	Converts ULD files to DECSIM text load files.
+	Dick Sites 3-Feb-82
+*/
+
+/*
+	Input file: xxx.ULD
+	Output files: xCODEx.MEM
+
+	Transformations:
+
+	/radix:16 is plastered onto the front of each output file.
+
+	input			output
+	-------			-------
+	; ...			! ...
+	[aaa]I=ppppccccccbb	[pppp]:ccccc	in file IPLA.MEM
+				[pppp]:bb       in file BRANCH.MEM
+	ALL other lines deleted
+*/
+
+
+uldtotext: proc options(main);
+
+%replace	false by '0'b;
+%replace	true  by '1'b;
+
+dcl (i,j) fixed bin(31), c char(1);
+dcl t char(255) var;
+dcl eof bit(1);
+dcl (innname,outname) char(63) var;
+dcl innfile file record;
+
+
+dcl outcount FIXED BIN(31);
+dcl iplafile file stream;
+dcl branchfile file stream;
+
+dcl inline char(255) var;
+dcl dot_count fixed bin(31);
+
+dcl (addr_string,ipla_string,branch_string) char(32) var;
+dcl memory char(1);
+
+
+GET_FILE_AND_DEBUG: PROCEDURE;
+%include $stsdef;
+declare lib$get_foreign external entry(char(*)) options(variable) returns(fixed binary(31));
+declare (input_BUFFER) character(132);
+DECLARE (POINT_START,BUFF_START,POINT_END) FIXED BINARY(31);
+
+
+INPUT_BUFFER=' ';
+
+sts$value=lib$get_foreign(input_BUFFER);
+
+POINT_START=VERIFY(INPUT_BUFFER,' ');
+
+IF POINT_START^= 0 THEN DO;
+	POINT_END = INDEX(SUBSTR(INPUT_BUFFER,POINT_START,132-POINT_START),' ');
+	innname=SUBSTR(INPUT_BUFFER,POINT_START,POINT_END-POINT_START);
+END;
+
+ELSE DO;
+
+	put skip list('input .ULD file name:');
+	get list(innname);
+	if index(innname,'.')=0 then
+		innname = innname || '.ULD';
+
+END;
+
+end;
+
+
+write_all_opened : PROC;
+	/* write current line to all files opened */
+	PUT FILE(iplafile) EDIT(inline) (a);
+	PUT FILE(iplafile) SKIP;
+	PUT FILE(branchfile) EDIT(inline) (a);
+	PUT FILE(branchfile) SKIP;
+END write_all_opened;
+
+
+openoutput : PROC(string);
+	/* put string to files opening it first if need be */
+
+	DCL string CHAR(255) VAR;
+
+	OPEN FILE(iplafile) TITLE('ipla.mem') OUTPUT;
+	PUT FILE(iplafile) EDIT('/RADIX:16') (a);
+	PUT FILE(iplafile) SKIP;
+	PUT FILE(iplafile) EDIT(string) (a);
+	PUT FILE(iplafile) SKIP;
+
+	OPEN FILE(branchfile) TITLE('branch.mem') OUTPUT;
+	PUT FILE(branchfile) EDIT('/RADIX:16') (a);
+	PUT FILE(branchfile) SKIP;
+	PUT FILE(branchfile) EDIT(string) (a);
+	PUT FILE(branchfile) SKIP;
+
+END openoutput;
+
+
+write_uld : PROC;
+	/* put current bitstring respective files */
+
+	IF memory = 'I' THEN 
+	DO;
+	  PUT FILE (iplafile) 
+		EDIT('['||addr_string||']:'||ipla_string) (a);
+	  PUT FILE (iplafile) SKIP;
+	  PUT FILE (branchfile) 
+		EDIT('['||addr_string||']:'||branch_string) (a);
+	  PUT FILE (branchfile) SKIP;
+	END;
+
+END write_uld;
+
+
+write_one_line: proc;
+	DCL (i,j) FIXED BIN(31);
+
+	/* DISCLAIMER: this is a cheap routine and does very little 
+		error checking */
+	IF length(inline)>0 THEN
+	    DO;
+		IF SUBSTR(inline,1,1) = ';' THEN
+		    DO;
+			SUBSTR(inline,1,1) = '!';
+			CALL write_all_opened;
+		    END;
+		ELSE IF SUBSTR(inline,1,1)='[' THEN
+		    DO;
+			i = index(inline,']');
+/*	[xxx] ... */
+/*	1   i     */
+			addr_string = SUBSTR(inline,2,i-2);
+			c = substr(inline,i+1,1);
+			IF ('A' <= c) & (c <= 'Z') THEN
+			    DO; memory = c; i = i+1; END;
+			ELSE
+			    memory = 'U';
+			i = INDEX(SUBSTR(inline,i),'=') + i;
+/*	[xxx]A = xxxx */
+/*	1       i     */
+			DO WHILE(SUBSTR(inline,i,1)=' ');
+				i = i+1;
+			END;
+/*	[xxx]A = xxxx */
+/*	1        i    */
+	j = 0;
+			IF memory = 'I' THEN
+			DO;
+			  IF SUBSTR(inline,i,2) = '00' THEN
+			  DO;
+			    addr_string = SUBSTR(inline,i+2,3);
+			    ipla_string = SUBSTR(inline,i+5,6);	/* just the bits */
+			    branch_string = SUBSTR(inline,i+11,2);
+			    CALL write_uld;
+			  END;
+			END;
+		    END;
+	    END;
+end; /* write_one_line */
+
+
+
+/*** begin main program ***/
+CALL GET_FILE_AND_DEBUG;
+
+put skip list('ULD to TEXT program');
+put edit('Opening ', innname) (a,a);
+put skip;
+open file(innfile) title(innname) record input;
+
+CALL openoutput('!');	/* initial open, to get 
+						   comments from uld */
+
+eof = '0'b;
+on endfile(innfile) eof = '1'b;
+dot_count = 0;
+
+do while(^eof);
+	read file(innfile) into (inline);
+	call write_one_line;
+end; /* do while */
+
+PUT SKIP;
+put edit('Closing ',innname)(a,a); put skip;
+close file(innfile);
+CLOSE FILE(iplafile);
+CLOSE FILE(branchfile);
+
+end; /* ulttotext */
+

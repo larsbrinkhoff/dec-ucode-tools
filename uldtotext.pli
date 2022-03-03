@@ -1,0 +1,382 @@
+/*
+	Converts ULD files to DECSIM text load files.
+	Dick Sites 3-Feb-82
+
+Revision history:
+ 9-Jul-82  RLS  Take out ;= comments in .MEM
+ 9-Jul-82  RLS  Take out timestamp (ALLOC3 does it now)
+ 8-Jul-82  RLS  Take out calls to putdot
+09-Jun-82  RLS  Track timestamp field for Micro-2 version 1M(01)
+05-Apr-82  RLS  Add time-stamp 
+
+*/
+
+/*
+	Input file: xxx.ULD
+	Output files: xCODEx.MEM
+
+	Transformations:
+
+	/radix:16 is plastered onto the front of each output file.
+
+	input			output
+	-------			-------
+	; ...			! ...
+	[aaa]X=bbcccccccc	[aaa]:cccccccc in file XCODE0.MEM
+				[aaa]:bb       in file XCODE1.MEM
+	[aaa]=bbcccccccc	[aaa]:cccccccc in file UCODE0.MEM
+				[aaa]:bb       in file UCODE1.MEM
+	ALL other lines deleted
+
+SAMPLE INPUT FILE:
+
+; ALLOCATED  3-APR-82 21:09:37
+;    BR.ULD	     MICRO2  1L(03)	 3-APR-82 21:06:50
+;RADIX 16				------------------
+;RTOL					   time-stamp
+[002A]=0080000082
+[002B]=8080002028
+[002D]=0080003036
+[002E]=5504042000
+[0000]=00800001A7
+[0001]=00800005A6
+ ...
+[0036]=8080001D80
+[0038]=8080002028
+FIELD A=<41:38>
+ A=0A
+ ALU.CC..FLAGS=0D
+ AP=0C
+ ATDL=0B
+ B=0B
+ B.SIGN=0E
+ ...
+FIELD X.LONG=<90:90>
+FIELD X.SETALUCC=<86:86>
+FIELD X.SETPSLCC=<87:87>
+FIELD X.WORD=<68:68>
+END
+
+*/
+
+
+
+uldtotext: proc options(main);
+
+%replace	false by '0'b;
+%replace	true  by '1'b;
+Dcl file_name char(50) var;
+dcl (i,j) fixed bin(31), c char(1);
+dcl t char(255) var;
+dcl eof bit(1);
+dcl (innname,outname) char(63) var;
+dcl innfile file record;
+DCL time_stamp_string CHAR(18);
+DCL time_stamp_hex CHAR(8);
+
+dcl opened(1:26,0:3) bit(1);
+dcl outfile(1:26,0:3) file variable;
+
+dcl outcount FIXED BIN(31);	/* this crap gets around PL/I restriction */
+dcl outfile0 file stream;	/* that doesn't allow array of files	  */ 
+dcl outfile1 file stream;
+dcl outfile2 file stream;
+dcl outfile3 file stream;
+dcl outfile4 file stream;
+dcl outfile5 file stream;
+dcl outfile6 file stream;
+dcl outfile7 file stream;
+dcl outfile8 file stream;
+dcl outfile9 file stream;
+dcl outfilea file stream;
+dcl outfileb file stream;
+dcl outfilec file stream;
+dcl outfiled file stream;
+dcl outfilee file stream;
+dcl outfilef file stream;
+
+dcl inline char(255) var;
+dcl dot_count fixed bin(31);
+
+dcl (addr_string,bit_string) char(255) var;
+dcl memory char(1);
+
+
+putdot : PROC(c);
+	DCL c CHAR(1);
+	IF mod(dot_count,50)=0 THEN
+		PUT SKIP;
+	PUT EDIT(c) (a);
+	dot_count = dot_count+1;
+END putdot;
+
+
+write_all_opened : PROC;
+	/* write current line to all files opened */
+	DCL (i,j) FIXED BIN(31);
+	DO i = 1 TO 26;
+	    DO j = 0 TO 3;
+		IF opened(i,j) THEN
+		    DO;
+			PUT FILE(outfile(i,j)) EDIT(inline) (a);
+			PUT FILE(outfile(i,j)) SKIP;
+		    END;
+	    END;
+	END;
+END write_all_opened;
+
+get_file : PROC(i,j);
+	/* assign a file constant to file var outfile(i,j) */
+	DCL (i,j) FIXED BIN(31);
+	goto l(outcount);
+l(0):	outfile(i,j) = outfile0; outcount=outcount+1; return;
+l(1):	outfile(i,j) = outfile1; outcount=outcount+1; return;
+l(2):	outfile(i,j) = outfile2; outcount=outcount+1; return;
+l(3):	outfile(i,j) = outfile3; outcount=outcount+1; return;
+l(4):	outfile(i,j) = outfile4; outcount=outcount+1; return;
+l(5):	outfile(i,j) = outfile5; outcount=outcount+1; return;
+l(6):	outfile(i,j) = outfile6; outcount=outcount+1; return;
+l(7):	outfile(i,j) = outfile7; outcount=outcount+1; return;
+l(8):	outfile(i,j) = outfile8; outcount=outcount+1; return;
+l(9):	outfile(i,j) = outfile9; outcount=outcount+1; return;
+l(10):	outfile(i,j) = outfilea; outcount=outcount+1; return;
+l(11):	outfile(i,j) = outfileb; outcount=outcount+1; return;
+l(12):	outfile(i,j) = outfilec; outcount=outcount+1; return;
+l(13):	outfile(i,j) = outfiled; outcount=outcount+1; return;
+l(14):	outfile(i,j) = outfilee; outcount=outcount+1; return;
+l(15):	outfile(i,j) = outfilef; outcount=outcount+1; return;
+l(16):	PUT EDIT ('*** more than 16 files needed. died. ***')(a); return;
+END get_file;
+
+
+myput : PROC(i,j,string);
+	/* put string to file (i,j), opening it first if need be */
+
+	DCL (i,j) FIXED BIN(31);
+	DCL string CHAR(255) VAR;
+	DCL t CHAR(255) VAR;
+	IF ^ opened(i,j) THEN
+	    DO;
+		CALL get_file(i,j);
+		t = byte(rank('A')+i-1)||'CODE'||byte(rank('0')+j)||'.MEM';
+		OPEN FILE(outfile(i,j)) TITLE(t) OUTPUT;
+		PUT FILE(outfile(i,j)) EDIT('/RADIX:16') (a);
+		PUT FILE(outfile(i,j)) SKIP;
+		opened(i,j) = true;
+	    END;
+	PUT FILE(outfile(i,j)) EDIT(string) (a);
+	PUT FILE(outfile(i,j)) SKIP;
+END myput;
+
+
+write_uld : PROC;
+	/* put current bitstring into 1..4 files */
+	DCL (i,j) FIXED BIN(31);
+	DCL len FIXED BIN(31);
+
+	i = rank(memory) - rank('A') + 1;
+	j = 0;
+	DO WHILE(LENGTH(bit_string) > 8);
+	    len = LENGTH(bit_string);
+	    CALL myput(i,j,'['||addr_string||']:'||SUBSTR(bit_string,len-7,8));
+	    j = j+1;
+	    bit_string = substr(bit_string,1,len-8);
+	END;
+	CALL myput(i,j,'['||addr_string||']:'||bit_string);
+END write_uld;
+
+
+find_time_stamp : PROC;
+	/* extract time from Micro-2 .ULD heading line */
+	DCL (i,j) FIXED BIN(31);
+	DCL (da,mo,hr,mn) CHAR(2);
+	DCL mon CHAR(3);
+	
+/*
+old:
+;    BR.ULD	     MICRO2  1L(03)	 3-APR-82 21:06:50
+;   V11.ULD          MICRO2  1L(03)     11-JAN-82 08:53:41                      
+					------------------
+123456789.123456789.123456789.123456789.123456789.123456789.
+
+newer:
+;      TST.ULD               MICRO2  1M(01)     9-JUN-82  22:16:13              
+123456789.123456789.123456789.123456789.123456789.123456789.123456789.
+*/
+
+	inline = untab(inline);
+	IF LENGTH(inline)<63 THEN RETURN;
+	da = SUBSTR(inline,48,2);			/* day */
+	IF SUBSTR(da,1,1) = ' ' THEN SUBSTR(da,1,1) = '0';
+	IF VERIFY(da,'0123456789')^=0 THEN RETURN;	/* not digits */
+
+	mon = SUBSTR(inline,51,3);
+	i = INDEX('JANFEBMARAPRMAYJUNJULAUGSEPOCTNOVDEC',mon);
+	IF i=0 THEN RETURN;
+	i = DIVIDE(i-1,3,31,0)+1;			/* 1-12 */
+	SUBSTR(mo,1,1) = BYTE( DIVIDE(i,10,31,0) + RANK('0') );
+	SUBSTR(mo,2,1) = BYTE( MOD(i,10)         + RANK('0') );
+
+	hr = SUBSTR(inline,59,2);
+	IF SUBSTR(hr,1,1) = ' ' THEN SUBSTR(hr,1,1) = '0';
+	IF VERIFY(hr,'0123456789')^=0 THEN RETURN;	/* not digits */
+
+	mn = SUBSTR(inline,62,2);
+	IF SUBSTR(mn,1,1) = ' ' THEN SUBSTR(mn,1,1) = '0';
+	IF VERIFY(mn,'0123456789')^=0 THEN RETURN;	/* not digits */
+
+	time_stamp_hex = mo||da||hr||mn;
+put skip; put edit('Time stamp : ',mo||'-'||da||' '||hr||':'||mn)(A,A); put skip;
+
+END find_time_stamp;
+
+
+write_one_line: proc;
+	DCL (i,j) FIXED BIN(31);
+
+	/* DISCLAIMER: this is a cheap routine and does very little 
+		error checking */
+	IF length(inline)>=2 THEN
+	    DO;
+		IF SUBSTR(inline,1,1) = ';' & SUBSTR(inline,2,1)^='=' THEN
+		    DO;		/* ignores ;= */
+			/*CALL putdot(';')*/;
+			IF INDEX(inline,'MICRO2')^=0 THEN
+				CALL find_time_stamp;
+			SUBSTR(inline,1,1) = '!';
+			CALL write_all_opened;
+		    END;
+		ELSE IF SUBSTR(inline,1,1)='[' THEN
+		    DO;
+			i = index(inline,']');
+/*	[xxx] ... */
+/*	1   i     */
+			addr_string = SUBSTR(inline,2,i-2);
+			c = substr(inline,i+1,1);
+			IF ('A' <= c) & (c <= 'Z') THEN
+			    DO; memory = c; i = i+1; END;
+			ELSE
+			    memory = 'U';
+			i = INDEX(SUBSTR(inline,i),'=') + i;
+/*	[xxx]A = xxxx */
+/*	1       i     */
+			DO WHILE(SUBSTR(inline,i,1)=' ');
+				i = i+1;
+			END;
+/*	[xxx]A = xxxx */
+/*	1        i    */
+			bit_string = SUBSTR(inline,i);	/* just the bits */
+			/*CALL putdot(memory)*/;
+			CALL write_uld;
+		    END;
+		ELSE
+		    /*CALL putdot('.')*/;
+	    END;
+	ELSE
+	    /*CALL putdot('.')*/;
+end; /* write_one_line */
+
+
+
+
+GET_FILE_AND_DEBUG: PROCEDURE;
+%include $stsdef;
+declare lib$get_foreign external entry(char(*)) options(variable) returns(fixed binary(31));
+declare (input_BUFFER) character(132);
+DECLARE (POINT_START,BUFF_START,POINT_END) FIXED BINARY(31);
+
+
+INPUT_BUFFER=' ';
+
+sts$value=lib$get_foreign(input_BUFFER);
+
+POINT_START=VERIFY(INPUT_BUFFER,' ');
+
+IF POINT_START^= 0 THEN DO;
+	POINT_END = INDEX(SUBSTR(INPUT_BUFFER,POINT_START,132-POINT_START),' ');
+	FILE_NAME=SUBSTR(INPUT_BUFFER,POINT_START,POINT_END-POINT_START);
+END;
+
+ELSE DO;
+	PUT SKIP LIST('INPUT FILE NAMES: ');
+	GET LIST(FILE_NAME);
+
+END;
+
+end;
+
+
+untab: proc(s) returns(char(255)var);
+	/* removes tabs from an input line */
+	dcl s char(255)var;
+	dcl local_copy char(255)var;
+	dcl i fixed bin(31);
+	DCL tab CHAR(1);
+
+	tab = byte(9); /* ascii tab character */
+
+	local_copy = s;
+	i = index(local_copy,tab);
+	do while (i>0);
+		local_copy = substr(local_copy,1,i-1) ||
+				substr('        ',1,8-mod(i-1,8)) ||
+				substr(local_copy,i+1);
+		i = index(local_copy,tab);
+	end; /* do while */
+	return(local_copy);
+end; /* untab */
+
+
+/*** begin main program ***/
+CALL GET_FILE_AND_DEBUG;
+
+put edit('ULD to TEXT program. rls 8-Jul-82') (A);
+put skip;
+put edit('Opening  ',FILE_NAME,' .ULD file') (a,A,A);
+put skip;
+open file(innfile) title(FILE_NAME) record input;
+
+do i = 1 to 26;
+    do j = 0 to 3;
+	opened(i,j) = false;
+    end;
+end;
+outcount = 0;
+CALL myput(rank('U')-rank('A')+1,0,'!');	/* initial open, to get 
+						   comments from uld */
+
+time_stamp_string = '';
+time_stamp_hex    = '00000000';
+
+eof = '0'b;
+on endfile(innfile) eof = '1'b;
+dot_count = 0;
+
+do while(^eof);
+	read file(innfile) into (inline);
+	call write_one_line;
+end; /* do while */
+
+/* put out timestamp */
+/* IF time_stamp_hex^='00000000' THEN
+    DO;
+	CALL myput(rank('U')-rank('A')+1,0, '! time stamp:');
+	CALL myput(rank('U')-rank('A')+1,0, '[7FFF]:'||time_stamp_hex);
+    END; */
+
+PUT SKIP;
+put edit('Closing ',innname)(a,a); put skip;
+close file(innfile);
+do i = 1 to 26;
+    do j = 0 to 3;
+	if opened(i,j) then
+	    do; 
+		t = byte(rank('A')+i-1)||'CODE'||byte(rank('0')+j)||'.MEM';
+		put edit('Closing ',t)(a,a); put skip;
+		CLOSE FILE(outfile(i,j));
+	    end;
+    end;
+end;
+
+end; /* ulttotext */
+

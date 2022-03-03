@@ -1,0 +1,2689 @@
+ALLOC2:  Procedure Options(main);
+/*
+CHANGE HISTORY:
+8-JUL-82   jaw  suppress error message for conflicting instructions
+		if preallocated.
+7-jul-82   Jaw  fix bug in linking...ignore timestamp at 7FFF
+28-jun-82  jaw  add linking....
+22-Jun-82  RLS  Try to make backtracking faster
+18-Jun-82  RLS  Add already_allocated counts
+18-Jun-82  RLS  Fix polarity of flag for GIVE_ABS...
+18-Jun-82  RLS  Breakthru on backtracking in ALLOC_TEMPL_LIST
+		redo entire backtracking structure
+17-Jun-82  RLS  Add 2x to weighting of singletons
+17-Jun-82  RLS  Yet more debugging output for watching allocation
+17-Jun-82  RLS  Truncate trivial debugging output
+17-Jun-82  RLS  Put back in call to GIVE_CLUST_ in ALLOC_TEMPL_LIST
+17-Jun-82  RLS  Added Debug_n and RLS_dump routines
+17-Jun-82  RLS  update header date
+17-Jun-82  RLS  add "line" to error messages for line numbers
+17-Jun-82  RLS  Create dump_old_alloc
+17-Jun-82  RLS  add BIT_D for dumping
+17-Jun-82  RLS  Do temp_block_to_range later in allocate_template_list
+		(tries to fix just-in-front-of-4K bug)
+17-Jun-82  RLS  Change clust_total_val_one to use MIN instead of average
+		(tries to do heavily-constrained clusters first)
+17-Jun-82  RLS  Change dec_hex to return EXACTLY 4 chars of hex
+
+*/
+
+%REPLACE TRUE BY '1'B;
+%REPLACE FALSE BY '0'B;
+%REPLACE ALIGN_STRING_SIZE BY 6;
+%REPLACE BLOCK_SIZE BY 4096;		/* Block constraint size */
+%REPLACE LEN_OPT_STRING BY 8;  		/* options string length for cluster dumping */
+%REPLACE OPT_LIST_LEN BY 4;    		/* options string length for instruction dumping */
+%REPLACE MAX_ADDR BY 32767;  		/* scope of addressing space */
+%REPLACE MAX_LAB BY 10000;  		/* scope of addressing space */
+%REPLACE MAX_ALIGN BY 32;    		/* max alignment possible on scorpio */
+%REPLACE SMALL_TEMPLATE BY 64; 		/* small size template */
+%REPLACE RECOUNT BY 100;		/* recount and resort the clusters after allocating this many instructions */
+
+DECLARE (FROM,
+         TO,
+	 NEXT_SLOT, 
+         HIGH_EXT,
+         LOW_EXT,
+	 OFFSET,
+         LINENUM,
+	 MAX_ALLOC,
+    	 NUM_ALLOC,
+	 TEMPNUM)
+        FIXED BINARY(31);
+
+DECLARE WORDS_LEFT(-1:MAX_ADDR) FIXED BIN(31);	/* Number of unallocated microwords less than
+						   each absolute address */
+
+DECLARE (ABS_TEMP,                     /* Points to the absolute template node */
+	PTR_INST_TO,
+	PTR_INST_FROM,
+	PTR_TEMP_TO,
+	PTR_TEMP_FROM,
+	PTR_CLUST_FROM,
+	PTR_CLUST_TO,
+	HEAD_CLUSTER,
+	TAIL_CLUSTER,
+	NEW_INST,
+	NEW_BLOCK,
+	NEW_CLUSTER,
+	NEW_TEMPLATE,
+	NEW_RANGE,
+        NEW_STRING1,
+	INST_PTR) PTR ;
+
+DECLARE INST_INFO(-1:MAX_ADDR) PTR ;  /* the array holds pointer for each micro2 instruction
+                                        to a block of information about that instruction */
+
+DECLARE DATE1 CHARACTER(80);  /* used in inputing creation dates of files */
+DECLARE DATE2 CHARACTER(80);
+DECLARE DATE3 CHARACTER(80);
+
+DECLARE 1 EXTERNALS(0:MAX_LAB),
+	  2 NAME CHAR(50) VARYING,
+	  2 ADR  FIXED BINARY(31),
+          2 TYPE BIT(1);
+
+DECLARE OLD_ALLOC BIT(MAX_ADDR);
+
+DECLARE (BLOCK_LIST_HEAD,NEW_BLOCK_LIST) PTR;
+
+DECLARE 1 BLOCK_LIST_NODE BASED(NEW_BLOCK_LIST),
+          2 NEXT_BLOCK_LIST PTR,
+          2 PRIOR_BLOCK_LIST PTR,
+          2 BLOCK_LIST PTR;
+
+DECLARE 1 BLOCK_NODE BASED(NEW_BLOCK),
+          2 NEXT_BLOCK PTR,
+          2 PRIOR_BLOCK PTR,
+          2 M2_INST_NUM FIXED BINARY(31),
+          2 LINE_NUM   FIXED BINARY(31); /* holds micro2 line number constraint came from */
+
+DECLARE 1 CLUSTER_NODE BASED(NEW_CLUSTER),
+          2 NEXT_CLUSTER PTR,           /* points to next cluster in cluster link list */
+          2 PRIOR_CLUSTER PTR,		/* points to prior cluster in cluster link list */
+          2 TEMP_LIST PTR,               /* points to first template in cluster */
+          2 CLUST_VAL FIXED BINARY(31),  /* holds allocation difficulty value */
+          2 CLUST_NUM FIXED BINARY(31),   /* number of template for debugging output */
+          2 RANGE_LIST PTR;              /* point to link list of range constraints between templates in the cluster */
+
+DECLARE 1 RANGE_NODE BASED(NEW_RANGE),
+          2 NEXT_RANGE_NODE PTR,             /* points to the next range node */
+          2 PRIOR_RANGE_NODE PTR,             /* points to the prior range node */
+          2 TEMP1_ADR PTR,               /* range constraint is from TEMP1_ADR to TEMP2_ADR */
+          2 TEMP2_ADR PTR,
+          2 HIGH FIXED BINARY(31),       /* holds max difference */
+          2 LOW FIXED BINARY(31),        /* holds min difference */
+          2 HIGH_LINE_NUM FIXED BINARY(31),  /* holds micro2 line number high came from */
+          2 LOW_LINE_NUM  FIXED BINARY(31);  /* holds micro2 line number low came from */
+
+DECLARE 1 TEMPLATE_NODE BASED(NEW_TEMPLATE),
+          2 NEXT_TEMPLATE PTR,           /* points to next template in the cluster */
+          2 PRIOR_TEMPLATE PTR,           /* points to prior template in the cluster */
+          2 TEMPLATE PTR,                /* points to large size template if not null */
+          2 TEMP_VAL FIXED BINARY(31),   /* holds allocation difficulty value for template */
+          2 TEMP_NUM FIXED BINARY(31),   /* number of template for debugging output */
+          2 CLUSTER PTR,                 /* points to template cluster is in */
+          2 INST_LIST PTR,               /* points to list of instruction in that template */
+          2 ALIGNLIST BIT(MAX_ALIGN),    /* holds alignment list mod MAX_ALIGN */
+          2 ALIGN_LINE_NUM FIXED BINARY(31),  /* holds micro2 line number alignment came from */
+          2 LAST_ONE FIXED BINARY(31),        /* pointer to last one in template */
+          2 NUM_ONES FIXED BINARY(31),        /* holds number of allocated positions in template */
+          2 SMALL_STRING BIT(SMALL_TEMPLATE), /* holds small size alignment string */
+          2 ABS_HIGH FIXED BINARY(31),
+          2 ABS_LOW FIXED BINARY(31),
+	  2 BACKTRACK_BOUND FIXED BINARY(31),	/* don't allocate below this */
+          2 ALIGN_VAL FIXED BINARY(31);
+
+DECLARE 1 TEMP_STRING BASED(NEW_STRING1), 
+          2 TEMP_STR BIT(max_addr);    /* large size alignment string */
+
+DECLARE 1 INST_LIST_NODE BASED(INST_PTR),
+          2 NEXT_INST PTR,                   /* points to next instruction in instruction list */
+          2 PRIOR_INST PTR,                   /* points to prior instruction in instruction list */
+          2 INST FIXED BINARY(31),           /* micro2 instruction number of instruction allocated in the template */
+          2 TEMP_NODE PTR,              /* points to template that instruction is in */
+          2 TEMP_POS FIXED BINARY(31),  /* holds the position instrution is in the template */
+          2 BLOCK_LIST_PTR PTR,             /* points to the block contraint list the instruction is in */
+          2 BLOCK_NODE_PTR PTR,             /* Points to the node the instruction is in the block list*/
+          2 TEMP_LINE_NUM FIXED BINARY(31); /* line number of how instruction got in template */
+
+DECLARE FAKE_TEMP BIT(MAX_ADDR);
+DECLARE (ADR_INFILE,ADR_OUTFILE,CON_INFILE,
+         EXT_INFILE,LINK_INFILE) FILE ;
+DECLARE NULL BUILTIN;
+DECLARE (LINK, KILL_ERROR_MESS, BIT_L, BIT_P, BIT_X, BIT_Y, BIT_A, BIT_R, BIT_B, BIT_Q, BIT_S, BIT_Z, BIT_I, BIT_C) BIT(1);
+DECLARE FILE_LINE CHARACTER(132);
+DECLARE (BIT_HAT) BIT(1) ALIGNED;
+DECLARE (DEBUG) CHARACTER(64) VARYING ;
+DECLARE DEBUG_N FIXED BINARY(31);	/* debugging counter */
+DECLARE (FILE_NAME,LINK_NAME)  CHARACTER(50) VARYING;
+DECLARE CURR_TOTAL_ALLOC FIXED BINARY(31);
+DECLARE OLD_TOTAL_ALLOC FIXED BINARY(31);
+DECLARE ALLOCATED_AT_LAST_RECOUNT FIXED BINARY(31);
+
+CALL PROLOGUE;   /* open files etc..... */
+
+
+CALL INITIAL;  /* initialize data structure */
+
+IF BIT_I THEN DO;
+   CALL DUMP_INSTR_ALL('1111'B);
+   CALL DUMP_WORLD('11111111'B);
+END;
+
+PUT SKIP LIST('START LINK PHASE');
+CALL LINK_OLD_ULD;
+PUT SKIP LIST('END LINK PHASE');
+
+PUT SKIP EDIT('START CONSTRAINT INPUT PHASE')(A);
+CALL INPUT_CONSTRAINTS;  /* input constraints and build datastr */
+IF BIT_C THEN CALL DUMP_INSTR_ALL('1111'B);
+IF BIT_C THEN CALL DUMP_WORLD('11111111'B);
+PUT SKIP EDIT('END CONSTRAINT INPUT PHASE')(A);
+
+PUT SKIP EDIT('START SORTING PHASE')(A);
+CALL ABS_RANGE_WORLD(HEAD_CLUSTER);  /* gives all templates their absolute ranges */
+
+CALL ALIGN_VALUE_WORLD;   /* gives all templates their alignment value */
+
+CALL TOTAL_VALUE_ALL(HEAD_CLUSTER);        /* gives all templates their value based on alignment and absolute range */
+IF BIT_Z THEN CALL DUMP_WORLD('11111111'B);
+
+CALL SORT_WORLD(HEAD_CLUSTER);
+IF BIT_S THEN CALL DUMP_WORLD('11111111'B);
+PUT SKIP EDIT('END SORTING PHASE')(A);
+
+IF INDEX(DEBUG,'!')^=0 THEN CALL RLS_DUMP_CLUSTERS(HEAD_CLUSTER);
+
+PUT SKIP EDIT('START ALLOCATION PHASE')(A);
+CALL ALLOCATE_WORLD;
+IF BIT_Q THEN CALL DUMP_WORLD('11111111'B);
+PUT SKIP EDIT('END ALLOCATION PHASE')(A);
+
+CALL EPILOGUE;  /*  close files etc.....   */
+
+
+
+GET_FILE_AND_DEBUG: PROCEDURE;
+%include $stsdef;
+declare lib$get_foreign external entry(char(*)) options(variable) returns(fixed binary(31));
+declare (input_BUFFER) character(132);
+DECLARE (POINT_START,BUFF_START,POINT_END) FIXED BINARY(31);
+
+
+INPUT_BUFFER=' ';
+
+sts$value=lib$get_foreign(input_BUFFER);
+
+input_buffer=TRANSLATE(input_buffer,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                      'abcdefghijklmnopqrstuvwxyz'); 
+
+POINT_START=VERIFY(INPUT_BUFFER,' ');
+
+IF POINT_START^= 0 THEN DO;
+	POINT_END = INDEX(SUBSTR(INPUT_BUFFER,POINT_START,132-POINT_START),' ');
+	FILE_NAME=SUBSTR(INPUT_BUFFER,POINT_START,POINT_END-POINT_START);
+
+	BUFF_START=INDEX(INPUT_BUFFER,'/LINK=');
+	IF BUFF_START=0 THEN LINK=FALSE;
+	ELSE DO;
+	   LINK_NAME = SUBSTR(INPUT_BUFFER,BUFF_START+6,INDEX(SUBSTR(INPUT_BUFFER,BUFF_START+6,132-BUFF_START-6),' ')-1);
+           IF LINK_NAME='' THEN LINK=FALSE;
+		ELSE IF LINK_NAME=' ' THEN LINK=FALSE;
+		ELSE LINK=TRUE;
+        END;
+
+	BUFF_START=INDEX(INPUT_BUFFER,'/DEBUG=');
+	IF BUFF_START=0 THEN DEBUG=' ';
+	ELSE 
+		DEBUG = SUBSTR(INPUT_BUFFER,BUFF_START+7,INDEX(SUBSTR(INPUT_BUFFER,BUFF_START+7,132-BUFF_START-7),' ')-1);
+
+	put skip edit('Debugging options: ') (a);		
+	DEBUG=TRANSLATE(DEBUG,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                      'abcdefghijklmnopqrstuvwxyz'); 
+	put skip list(debug);
+	POINT_START=VERIFY(DEBUG,'.');
+	DEBUG_N = POINT_START-1;		/* for controlling dumping -- every leading dot = 1 */
+	put skip list(DEBUG_N);
+END;
+
+ELSE DO;
+	PUT SKIP LIST('INPUT FILE NAMES: ');
+	GET LIST(FILE_NAME);
+
+	PUT SKIP LIST('LINK FILE NAME: ');
+	GET LIST(LINK_NAME);
+        IF LINK_NAME='' THEN LINK='0'B; ELSE LINK='1'B;
+
+	PUT SKIP EDIT('I(nitial  S(SORT Q(ALLOCATE Z(PULL STRINGS L(ink C(onstraintInput, B(lock ',
+			'P(rint Procedure Names, R(ange A(lignment')(A);
+	PUT SKIP EDIT('Debugging options: ')(a);
+	GET LIST(DEBUG);
+	DEBUG=TRANSLATE(DEBUG,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                      'abcdefghijklmnopqrstuvwxyz'); 
+	PUT SKIP LIST(DEBUG);
+	POINT_START=VERIFY(DEBUG,'.');
+	DEBUG_N = POINT_START-1;		/* for controlling dumping -- every leading dot = 1 */
+	put skip list(DEBUG_N);
+END;
+
+END GET_FILE_AND_DEBUG;
+
+
+
+
+PROLOGUE: PROCEDURE;
+/* Open inputs files required by program and also input debugging
+   options */
+
+PUT SKIP LIST('ADDRESS ALLOCATOR, PASS 2. 22-Jun-82 rls,jaw');
+
+CALL GET_FILE_AND_DEBUG;
+
+PUT SKIP EDIT('OPENING INPUT FILE '||FILE_NAME||'.ADR')(A);
+OPEN FILE(ADR_INFILE) STREAM INPUT TITLE(FILE_NAME||'.ADR');
+
+PUT SKIP EDIT('OPENING INPUT FILE '||FILE_NAME||'.CON')(A);
+OPEN FILE(CON_INFILE) STREAM INPUT TITLE(FILE_NAME||'.CON');
+
+PUT SKIP EDIT('OPENING INPUT FILE '||FILE_NAME||'.EXT')(A);
+OPEN FILE(EXT_INFILE) STREAM INPUT TITLE(FILE_NAME||'.EXT');
+
+IF LINK THEN DO;
+   PUT SKIP EDIT('OPENING LINK INPUT FILE '||LINK_NAME||'.U40')(A);
+   OPEN FILE(LINK_INFILE) STREAM INPUT TITLE(LINK_NAME||'.U40');
+END;
+
+/* get dates and time input files were created */
+GET FILE(CON_INFILE) EDIT(DATE1)(A(80));
+GET FILE(EXT_INFILE) EDIT(DATE2)(A(80));
+GET FILE(ADR_INFILE) EDIT(DATE3)(A(80));
+
+/* writes file creation times back to output files */
+PUT SKIP EDIT(DATE2)(A);
+
+/* check dates and times of three files to see if they match */
+IF (DATE1 ^= DATE2) | (DATE2 ^=DATE3) THEN DO;
+   PUT  SKIP EDIT('WARNING....inconsistant file dates')(a);
+   PUT  SKIP EDIT('CON file: ',DATE1)(a,a);
+   PUT  SKIP EDIT('EXT file: ',DATE2)(a,a);
+   PUT  SKIP EDIT('ADR file: ',DATE3)(a,a);
+END;
+
+BIT_X= (INDEX(DEBUG,'X') >0);
+BIT_Y= (INDEX(DEBUG,'Y') >0);
+BIT_A= (INDEX(DEBUG,'A') >0);
+BIT_P= (INDEX(DEBUG,'P') >0);
+BIT_R= (INDEX(DEBUG,'R') >0);
+BIT_Q= (INDEX(DEBUG,'Q') >0);
+BIT_S= (INDEX(DEBUG,'S') >0);
+BIT_Z= (INDEX(DEBUG,'Z') >0);
+BIT_I= (INDEX(DEBUG,'I') >0);
+BIT_C= (INDEX(DEBUG,'C') >0);
+BIT_B= (INDEX(DEBUG,'B') >0);
+BIT_L= (INDEX(DEBUG,'L') >0);
+BIT_HAT= (INDEX(DEBUG,'^') >0);
+
+END PROLOGUE;
+
+
+INITIAL: PROCEDURE;
+/* Initial allocates the dummy instruction "-1" at location zero in the absolute
+   address space */
+DECLARE (I,M2_INST) FIXED BINARY(31);
+DECLARE TEMP_PTR PTR;
+DECLARE (ABS_RANGE,ABS_CLUSTER) PTR;
+
+/* initialize the varies pointers */
+KILL_ERROR_MESS=FALSE;
+NEXT_SLOT=0;
+HEAD_CLUSTER=NULL;   
+TEMPNUM=0;
+ABS_TEMP=NULL;
+BLOCK_LIST_HEAD=NULL;
+
+DO I=-1 TO MAX_ADDR;
+ INST_INFO(I)=NULL;
+ WORDS_LEFT(I) = I;
+END;
+CURR_TOTAL_ALLOC = 0;
+OLD_TOTAL_ALLOC  = 0;
+ALLOCATED_AT_LAST_RECOUNT = 0;
+OLD_ALLOC= '0'B;
+
+/* allocate the phoney -1 micro2 instruction number */
+M2_INST=-1;
+LINENUM=-7777;
+CALL CREATE_CLUSTER(M2_INST); 
+
+/* get rid of range constraint generated by create cluster call above */
+ABS_CLUSTER=HEAD_CLUSTER;        
+ABS_RANGE=ABS_CLUSTER->RANGE_LIST;
+FREE ABS_RANGE->RANGE_NODE;
+ABS_CLUSTER->RANGE_LIST=NULL;
+
+/* deallocate micro2 instruction -1 out of template only */
+TEMP_PTR=INST_INFO(-1)->TEMP_NODE;
+TEMP_PTR->NUM_ONES=0;
+TEMP_PTR->ABS_LOW=0;
+TEMP_PTR->ABS_HIGH=0;
+TEMP_PTR->LAST_ONE=1000;
+ABS_TEMP=TEMP_PTR;
+
+ALLOCATE TEMP_STRING SET(NEW_STRING1);
+   ABS_TEMP->TEMPLATE=NEW_STRING1;
+   ABS_TEMP->TEMPLATE->TEMP_STR='0'B;
+
+END INITIAL;
+
+
+EPILOGUE: PROCEDURE;
+/* close files used in the program */
+
+PUT SKIP EDIT('CLOSING INPUT FILE '||FILE_NAME||'.ADR')(A);
+CLOSE FILE(ADR_INFILE);
+
+PUT SKIP EDIT('CLOSING INPUT FILE '||FILE_NAME||'.CON')(A);
+CLOSE FILE(CON_INFILE);
+
+PUT SKIP EDIT('CLOSING INPUT FILE '||FILE_NAME||'.EXT')(A);
+CLOSE FILE(EXT_INFILE);
+
+END EPILOGUE;
+
+
+LINK_OLD_ULD: PROCEDURE;
+IF BIT_P THEN PUT SKIP EDIT('START link_old_uld ')(A);
+/* This procedure does the linking of the old ULD with the new ULD.  First the old ULD file 
+   is read in and the external variables and global variables are stored away.  Next the
+   allocated addresses are recording in the absolute allocation.  Next the EXT file generated
+   by ALLOC1 is read in and the global and externals are resovled with the old ULD globals and
+   externals.  If the external or global has been allocated by a previous run, then the data
+   structure is made to point to this allocated position */
+
+DECLARE DONE BIT(1);
+DECLARE P PTR;
+DECLARE I FIXED BINARY(31);
+
+KILL_ERROR_MESS=TRUE; /* kill merge template message of two instruction alloc at same location */
+FAKE_TEMP='0'B;
+NUM_ALLOC=0;
+MAX_ALLOC=0;
+
+/* get already allocated positions and old externals */
+IF LINK THEN CALL PROCESS_OLD_ULD;  
+
+/* fix up prameters for the absolute template */
+ABS_TEMP->NUM_ONES=NUM_ALLOC;
+ABS_TEMP->LAST_ONE=MAX(MAX_ALLOC,ABS_TEMP->LAST_ONE);
+
+CALL PROCESS_NEW_EXT; /* get new externals */
+
+P=ABS_TEMP->TEMPLATE;
+P->TEMP_STR=FAKE_TEMP;
+
+KILL_ERROR_MESS=FALSE;
+
+IF BIT_L THEN DO;
+   DO I=0 TO NEXT_SLOT;
+      PUT SKIP EDIT(EXTERNALS.NAME(I), EXTERNALS.ADR(I), EXTERNALS.TYPE(I))(A,F(8),B);
+   END;
+   CALL DUMP_INSTR_ALL('1111'B);
+   CALL DUMP_WORLD('11111111'B);
+END;
+
+RETURN;
+END LINK_OLD_ULD;
+
+PROCESS_NEW_EXT: PROCEDURE;
+/* Resolves new externals and globals and enters them in data structure */
+
+DECLARE DONE BIT(1);
+
+ON ENDFILE(EXT_INFILE) DONE='1'B;
+DONE='0'B;
+FILE_LINE=' ';
+GET SKIP FILE(EXT_INFILE) EDIT(FILE_LINE)(A(80));
+
+DO WHILE(^DONE);
+   IF (BIT_L) THEN PUT SKIP LIST(FILE_LINE);
+   IF LENGTH(FILE_LINE)>12 THEN
+      IF ((SUBSTR(FILE_LINE,1,7)=';= GBL ')  | (SUBSTR(FILE_LINE,1,7)=';= EXT ')) THEN
+          CALL EXT_HANDLER;  /* enter new external into data structure */
+   FILE_LINE=' ';
+   GET FILE(EXT_INFILE) EDIT(FILE_LINE)(A(80));
+END;
+
+END PROCESS_NEW_EXT;
+
+EXT_HANDLER: PROCEDURE;
+DECLARE (LAB_END,POS,ADR) FIXED BINARY(31);
+DECLARE (NAME) CHAR(50) VARYING;
+
+LAB_END=INDEX(FILE_LINE,'..');  /* find EXT or GBL label end */
+
+IF LAB_END=0 THEN DO;
+   LAB_END=INDEX(FILE_LINE,'__');
+   IF LAB_END=0 THEN DO;
+      PUT SKIP(2) LIST('*** LINK WARNING....EXT OR GBL LABAL ILLEGAL');
+      RETURN;
+   END;
+END;
+
+ADR=HEX_CHAR(SUBSTR(FILE_LINE,8,4));  /* get micro2 address of label */
+NAME=SUBSTR(FILE_LINE,13,LAB_END-13); /* parse off name */
+
+IF FIND_LABEL(NAME,POS)   /* has name been seen already */
+THEN DO;   /* yes....make up the proper range constraint between the two */	    
+   TO=ADR;
+   LINENUM=-777;   
+   IF EXTERNALS.TYPE(POS) 
+   THEN DO;  /* already allocated....form absolute constraint with fake -1 element */  
+      FROM=-1;
+      LOW_EXT=EXTERNALS.ADR(POS);
+      HIGH_EXT=LOW_EXT;
+   END;
+   ELSE DO;  /* has not been allocated...make two instruction get allocated to same place */
+      FROM=EXTERNALS.ADR(POS);
+      LOW_EXT=0;
+      HIGH_EXT=0;
+   END;
+
+   IF BIT_L THEN DO;
+	PUT SKIP EDIT(' NEW EXT....ADR: ',ADR,' NAME: ', NAME)(A,F(7),A,A);
+	PUT SKIP EDIT('            FROM: ', FROM, ' TO: ', TO, ' LOW: ', LOW_EXT,' HIGH: ', HIGH_EXT)(A,F(7),A,F(7),A,F(7),
+							A,F(7));
+   END;
+
+   CALL RANGE_TYPE;  /* execute range constraint just built up */
+END;
+
+ELSE DO; /* no, label hasn't been seen...enter in ext data structure */
+   EXTERNALS.ADR(NEXT_SLOT)=ADR;
+   EXTERNALS.NAME(NEXT_SLOT)=NAME;
+   EXTERNALS.TYPE(NEXT_SLOT)='0'B;
+   NEXT_SLOT=NEXT_SLOT+1;
+END;
+
+IF BIT_L THEN DO;
+	PUT SKIP EDIT(' NEW EXT....ADR: ',ADR,' NAME: ', NAME)(A,F(7),A,A);
+	PUT SKIP EDIT('            FROM: ', FROM, ' TO: ', TO, ' LOW: ', LOW_EXT)(A,F(7),A,F(7),A,F(7));
+END;
+
+END EXT_HANDLER;
+
+PROCESS_OLD_ULD: PROCEDURE;
+/* this procedure reads through the ULD file to be link with.  It allocates
+   the positions in the addressing space that are in the ULD file. */
+
+DECLARE DONE BIT(1);
+
+ON ENDFILE(LINK_INFILE) DONE=TRUE; 
+DONE=FALSE;
+
+FILE_LINE=' ';
+GET SKIP FILE(LINK_INFILE) EDIT(FILE_LINE)(A(80));
+
+DO WHILE(^DONE);
+   IF (BIT_L) THEN PUT SKIP LIST(FILE_LINE);
+   IF LENGTH(FILE_LINE)>2 THEN DO;
+      IF SUBSTR(FILE_LINE,1,2)=';=' THEN 	CALL PROCESS_S_COMMENT;  /* process stylized comment */
+
+      ELSE IF SUBSTR(FILE_LINE,1,1)='[' THEN CALL PROCESS_M_CODE;   /* process microcode line */
+   END;
+   FILE_LINE=' ';
+   GET FILE(LINK_INFILE) EDIT(FILE_LINE)(A(80));
+END;
+
+END PROCESS_OLD_ULD;
+
+
+PROCESS_S_COMMENT: PROCEDURE;
+/* this procedure handles allocated globals and externals from previous allocation */
+DECLARE (POS,LAB_END,ADR) FIXED BINARY(31);
+DECLARE (NAME) CHAR(50) VARYING;
+
+IF ((SUBSTR(FILE_LINE,4,3)='GBL') | (SUBSTR(FILE_LINE,4,3)='EXT')) THEN DO;
+   LAB_END=INDEX(FILE_LINE,'..');
+
+   IF LAB_END=0 THEN DO;
+      LAB_END=INDEX(FILE_LINE,'__');
+      IF LAB_END=0 THEN DO;
+         PUT SKIP(2) LIST('*** LINK WARNING....EXT OR GBL LABAL ILLEGAL');
+         RETURN;
+      END;
+   END;
+
+   ADR=HEX_CHAR(SUBSTR(FILE_LINE,8,4));
+   NAME=SUBSTR(FILE_LINE,13,LAB_END-13);
+
+   IF FIND_LABEL(NAME,POS) THEN DO;	    
+      IF ADR^=EXTERNALS.ADR(POS) THEN DO;
+         PUT SKIP(2) LIST('*** LINK WARNING.... ULD file has same ext at different address. ext=', NAME);
+	 RETURN;
+      END;
+   END;
+
+   ELSE DO;
+	EXTERNALS.ADR(NEXT_SLOT)=ADR;
+	EXTERNALS.NAME(NEXT_SLOT)=NAME;
+	EXTERNALS.TYPE(NEXT_SLOT)='1'B;
+	NEXT_SLOT=NEXT_SLOT+1;
+   END;
+END;
+
+END PROCESS_S_COMMENT;
+
+
+FIND_LABEL: PROCEDURE(NAME,POS) RETURNS(BIT(1));
+/* See if name has already been seen */
+DECLARE (I,POS) FIXED BINARY(31);
+DECLARE NAME CHAR(50) VARYING;
+
+DO I=0 TO NEXT_SLOT;
+   IF NAME=EXTERNALS.NAME(I) THEN DO;
+      POS=I;
+      RETURN('1'B);
+   END;
+END;
+
+RETURN('0'B);
+END FIND_LABEL;
+
+
+PROCESS_M_CODE:  PROCEDURE;
+/* This procedure gets the locations in absolute space already allocated by a previous allocation
+    run.  These are entered into ABS_ALLOC which is moved to template 0 node of the datastructure */
+DECLARE DONE BIT(1);
+DECLARE RIGHT_BRACKET FIXED BINARY(31);
+DECLARE ABS_POSITION FIXED BINARY(31);
+
+   /* find the closing right bracket */
+   RIGHT_BRACKET=INDEX(FILE_LINE,']');
+
+   IF RIGHT_BRACKET>0 THEN 
+       IF ((SUBSTR(FILE_LINE,RIGHT_BRACKET+1,1)='U') | (SUBSTR(FILE_LINE,RIGHT_BRACKET+1,1)='=')) THEN DO;
+
+         /* convert hex char address to fixed binary */
+         ABS_POSITION=HEX_CHAR(SUBSTR(FILE_LINE,2,RIGHT_BRACKET-2));
+
+	 IF (ABS_POSITION < MAX_ADDR-1) & (ABS_POSITION >= 0) THEN DO;
+
+	 	/* keep track of previous allocated numbers */
+         	MAX_ALLOC=MAX(MAX_ALLOC,ABS_POSITION);
+         	NUM_ALLOC=NUM_ALLOC+1;
+
+         	/* allocate address in addressing space */
+         	SUBSTR(FAKE_TEMP,ABS_POSITION+1,1)='1'B;
+	 END;
+   END;
+
+IF BIT_L THEN DO;
+   PUT SKIP EDIT(FILE_LINE) (A);
+   PUT SKIP EDIT(RIGHT_BRACKET,ABS_POSITION)(F(8),F(8));
+END;
+
+END PROCESS_M_CODE;
+
+
+HEX_CHAR: PROCEDURE(HEX_NUM) RETURNS(FIXED BINARY(31));
+IF BIT_P THEN PUT SKIP EDIT('START hex_char ')(A);
+/* This procedure converts the hex character number to fixed binary */
+DECLARE HEX_NUM CHARACTER(10) VARYING;
+DECLARE (I,LEN_HEX,BIN_NUM) FIXED BINARY(31);
+DECLARE HEX_DIG CHARACTER(1);
+DECLARE BIN_DIG FIXED BINARY(31);
+
+LEN_HEX=LENGTH(HEX_NUM);
+BIN_NUM=0;
+DO I=1 TO LEN_HEX;
+   HEX_DIG=SUBSTR(HEX_NUM,LEN_HEX+1-I,1);
+   BIN_DIG=INDEX('0123456789ABCDEF',HEX_DIG) -1;
+   If BIN_DIG=-1 THEN BIN_DIG=0;
+   BIN_NUM=BIN_NUM + (BIN_DIG * (16**(I-1)));
+END;
+
+RETURN(BIN_NUM);
+
+END HEX_CHAR;
+         
+
+
+INPUT_CONSTRAINTS: PROCEDURE;
+/* this procedure inputs the constraints from xxxxx.CON and processes them
+   to build a structure of templates and clusters */
+DECLARE DONE BIT(1);
+DECLARE INSTRUCTION CHARACTER(1);
+ON ENDFILE(CON_INFILE) DONE=TRUE;
+
+DONE=FALSE;
+GET FILE(CON_INFILE) LIST(INSTRUCTION,LINENUM,FROM,TO,LOW_EXT,HIGH_EXT);
+
+DO WHILE(^DONE);
+   IF BIT_C THEN PUT  SKIP(2) EDIT(INSTRUCTION,LINENUM,FROM,TO,LOW_EXT,HIGH_EXT)
+                                                 (A,F(8),F(8),F(8),F(8),F(8));
+   IF INSTRUCTION='R' THEN 
+     DO; /*********   Range constraint ************/
+        CALL RANGE_TYPE;
+     END;
+   ELSE IF INSTRUCTION='A' THEN 
+     DO; /*********   alignment constraint **********/
+        CALL ALIGNMENT_TYPE;
+     END;
+   ELSE IF INSTRUCTION = 'B' THEN
+     DO; /*********  block constraint ***********/
+        CALL BLOCK_TYPE;
+     END;
+   ELSE
+     DO; /********* illegal instruction **********/
+        PUT  SKIP EDIT('*** Illegal instruction in .CON file.  Instruction is:  '||INSTRUCTION)(A);
+        GET FILE(CON_INFILE) SKIP;
+     END;
+   
+   GET FILE(CON_INFILE) LIST(INSTRUCTION,LINENUM,FROM,TO,LOW_EXT,HIGH_EXT);   /* get next constraint instruction */
+END;
+
+END INPUT_CONSTRAINTS;
+
+
+RANGE_TYPE: PROCEDURE;
+/* This file handles the range contraint type instruction */
+
+   IF BIT_R THEN DO;
+	PUT SKIP EDIT('RANGE_TYPE... FROM: ', FROM, ' TO: ', TO, ' LOW: ', LOW_EXT,' HIGH: ', HIGH_EXT)(A,F(7),A,F(7),A,F(7),
+							A,F(7));
+   END;
+
+/* create clusters for FROM and TO if they have not been seen in the 
+   input yet */
+IF INST_INFO(FROM)=NULL THEN CALL CREATE_CLUSTER(FROM);
+IF INST_INFO(TO)=NULL THEN CALL CREATE_CLUSTER(TO);
+
+/* set up pointers */
+PTR_INST_TO=INST_INFO(TO);
+PTR_TEMP_TO=PTR_INST_TO->TEMP_NODE;
+PTR_INST_FROM=INST_INFO(FROM);
+PTR_TEMP_FROM=PTR_INST_FROM->TEMP_NODE;
+
+IF HIGH_EXT=LOW_EXT THEN 
+   IF (PTR_TEMP_FROM=PTR_TEMP_TO) THEN 
+       CALL SAME_CLUST_SAME_TEMP;
+   ELSE CALL DIFF_TEMP_EQ_HL;
+
+ELSE IF HIGH_EXT>LOW_EXT THEN 
+          IF (PTR_TEMP_FROM=PTR_TEMP_TO) THEN 
+                CALL SAME_CLUST_SAME_TEMP;
+
+          ELSE  CALL DIFF_TEMP_DIFF_HL;
+
+     ELSE DO;
+         /* ***************ERROR*********************** */
+         PUT  SKIP EDIT('*** Inconsistant range constraint in .CON file.  ',
+              'LOW is greater then high in constraint from LINE: ',linenum)(a,a,f(7));
+         PUT  SKIP EDIT('Constraint is ignored!!')(a);
+     END;
+
+IF BIT_R THEN DO;
+   CALL DUMP_INSTR_ALL('1111'B);
+   CALL DUMP_WORLD('11111111'B);
+END;
+
+END RANGE_TYPE;
+
+
+DIFF_TEMP_EQ_HL: PROCEDURE;
+/* this routine handles range constraints with equal high and lows  and the instructions are in the same cluster
+   but different templates 
+       FROM,TO                       instructions range constraint is on
+       LOW_EXT,HIGH_EXT              is the range that TO must be from FROM
+       PTR_INST_FROM,PTR_INST_TO     point to the respective instructions information node
+       PTR_TEMP_FROM,PTR_TEMP_TO     points to the respective instructions template node    */
+
+DECLARE (I) FIXED BINARY(31);
+DECLARE (P,NEW_RANGE_LIST) PTR;
+
+IF BIT_P THEN PUT SKIP LIST('DIFF_TEMP_EQ_HL');
+
+OFFSET=HIGH_EXT + PTR_INST_FROM->TEMP_POS - PTR_INST_TO->TEMP_POS;    /* calculate the relative offsets between the templates */
+
+/* check and create new alignment, new template and new range.  if alright then combine the templates and leave */
+IF OFFSET<0 THEN  DO;
+	OFFSET=-OFFSET;
+	I=TO; TO=FROM; FROM=I;
+	P=PTR_INST_TO;  PTR_INST_TO=PTR_INST_FROM;  PTR_INST_FROM=P;
+        P=PTR_TEMP_TO;  PTR_TEMP_TO=PTR_TEMP_FROM;  PTR_TEMP_FROM=P;
+END;
+	
+PTR_CLUST_TO=PTR_TEMP_TO->CLUSTER;
+PTR_CLUST_FROM=PTR_TEMP_FROM->CLUSTER;
+
+IF MERGE_TEMPLATE() THEN 
+      DO;
+         CALL MERGE_RANGE(NEW_RANGE_LIST);
+         /* put in new range constraint */
+         IF PTR_TEMP_FROM=ABS_TEMP THEN DO;
+                PTR_CLUST_FROM->RANGE_LIST=NULL;
+                PTR_CLUST_TO->RANGE_LIST=NEW_RANGE_LIST;
+         END;
+         ELSE DO;
+                PTR_CLUST_TO->RANGE_LIST=NULL;
+                PTR_CLUST_FROM->RANGE_LIST=NEW_RANGE_LIST;
+         END;
+
+         IF (PTR_CLUST_TO=PTR_CLUST_FROM) | (PTR_TEMP_FROM=ABS_TEMP & PTR_CLUST_TO->TEMP_LIST^=NULL) THEN RETURN;
+
+         CALL COMBINE_CLUSTER;
+     END;
+
+
+
+END DIFF_TEMP_EQ_HL;
+
+
+
+SAME_CLUST_SAME_TEMP: PROCEDURE;
+/*  this routines handles range constraints on instructions that are in the same cluster and same template 
+     FROM,TO                             instructions that the range constraint is on 
+     PTR_INST_FROM,PTR_INST_TO           points to information blocks about the instructions */
+
+DECLARE (DIFF) FIXED BINARY(31);
+DECLARE (TO_CHAR,FROM_CHAR) CHARACTER(5);
+
+DIFF=PTR_INST_TO->TEMP_POS - PTR_INST_FROM->TEMP_POS; /* calc the diff of position in the template */
+
+/* check that the diff is within the range....if not ignore....   */
+IF DIFF> HIGH_EXT  | DIFF<LOW_EXT THEN DO;
+   CALL DEC_HEX(TO,TO_CHAR);
+   CALL DEC_HEX(FROM,FROM_CHAR);
+   PUT  SKIP EDIT('*** Conditional branch or region constraint is inconsistant with other branch constraints.')(A);
+   PUT  SKIP EDIT('    Current address constraint puts distance from .MCR address m',from_CHAR,' to .MCR address m', to_CHAR ,
+		   ' in the range from ',low_ext,' to ',high_ext,'.')
+                                  (a,A,a,A,a,f(7),a,f(7),a);
+   PUT  SKIP EDIT('    Previous constraint put distance between the instruction at exactly ',diff, 
+      '.   This constraint is from LINE ', PTR_INST_FROM->TEMP_LINE_NUM,' or ', PTR_INST_TO->TEMP_LINE_NUM)
+	(a,f(7),a,f(7),a,f(7));
+   PUT  SKIP EDIT('    The current constraint from LINE ',LINENUM, ' is ignored!')(A,F(7),a);
+
+   PUT SKIP EDIT('    Dump of instuctions allocated near .MCR address. ')(a);
+   put skip;
+
+   CALL PRINT_TEMPLATE(PTR_INST_FROM->TEMP_NODE,PTR_INST_TO->TEMP_POS-64);
+   put skip;
+CALL RLS_DUMP_ONE_CLUSTER(PTR_INST_FROM->TEMP_NODE->CLUSTER);
+END;
+
+END SAME_CLUST_SAME_TEMP;
+
+
+DIFF_TEMP_DIFF_HL: PROCEDURE;
+/* this routine handles range constraints where TO and FROM are in the same cluster and diff template....
+    also LOW_EXT ^= HIGH_EXT.
+
+    FROM,TO                      instruction that the range constraint is on 
+    PTR_INST_TO,PTR_INST_FROM    points the respective instructions information block
+    PTR_TEMP_TO,PTR_TEMP_FROM    points the respective instructions template information block   */
+
+DECLARE (NEW_HIGH,NEW_LOW) FIXED BINARY(31);
+DECLARE (RANGE_POINT,CLUST_POINT,NEW_NODE) PTR;
+
+PTR_CLUST_TO=PTR_TEMP_TO->CLUSTER;            /* get pointer to the cluster TO is in */
+PTR_CLUST_FROM=PTR_TEMP_FROM->CLUSTER;        /* get pointer to the cluster from is in */
+
+NEW_HIGH=HIGH_EXT + PTR_INST_FROM->TEMP_POS - PTR_INST_TO->TEMP_POS;   /* calc the relitive range between templates */
+NEW_LOW=LOW_EXT + PTR_INST_FROM->TEMP_POS - PTR_INST_TO->TEMP_POS;
+
+IF PTR_TEMP_TO = ABS_TEMP THEN DO;
+
+   /* See if there is already a range constraint between the two templates */
+   IF FIND_RANGE(PTR_TEMP_FROM,PTR_TEMP_TO,PTR_CLUST_FROM->RANGE_LIST,RANGE_POINT)
+      THEN DO;
+         /* if yes then combine old and new constraint */
+         IF ^CHANGE_RANGE(RANGE_POINT,PTR_TEMP_FROM,PTR_TEMP_TO,NEW_HIGH,NEW_LOW,LINENUM,LINENUM,LINENUM) THEN RETURN;
+   END;  
+
+   ELSE DO;
+      /* create range node for NEW range constraint between the two templates */
+      CALL ALLOCATE_RANGE(PTR_TEMP_FROM,PTR_TEMP_TO,NEW_HIGH,NEW_LOW,LINENUM,LINENUM,NEW_NODE);
+      
+      /*  add to list */
+      NEW_NODE->NEXT_RANGE_NODE=PTR_CLUST_FROM->RANGE_LIST;
+      NEW_NODE->PRIOR_RANGE_NODE=NULL;
+      IF PTR_CLUST_FROM->RANGE_LIST^=NULL THEN
+	   PTR_CLUST_FROM->RANGE_LIST->PRIOR_RANGE_NODE=NEW_NODE;
+         PTR_CLUST_FROM->RANGE_LIST=NEW_NODE;
+   END;
+END;
+ELSE DO;
+   /* See if there is already a range constraint between the two templates */
+   IF FIND_RANGE(PTR_TEMP_FROM,PTR_TEMP_TO,PTR_CLUST_TO->RANGE_LIST,RANGE_POINT)
+      THEN DO;
+         /* if yes then combine old and new constraint */
+         IF ^CHANGE_RANGE(RANGE_POINT,PTR_TEMP_FROM,PTR_TEMP_TO,NEW_HIGH,NEW_LOW,LINENUM,LINENUM,LINENUM) THEN RETURN;
+   END;  
+
+   ELSE DO;
+      	/* create range node for NEW range constraint between the two templates */
+      	CALL ALLOCATE_RANGE(PTR_TEMP_FROM,PTR_TEMP_TO,NEW_HIGH,NEW_LOW,LINENUM,LINENUM,NEW_NODE);
+	      
+      	/*  add to list */
+	NEW_NODE->NEXT_RANGE_NODE=PTR_CLUST_TO->RANGE_LIST;
+	NEW_NODE->PRIOR_RANGE_NODE=NULL;
+	IF PTR_CLUST_TO->RANGE_LIST^=NULL THEN
+		   PTR_CLUST_TO->RANGE_LIST->PRIOR_RANGE_NODE=NEW_NODE;
+	PTR_CLUST_TO->RANGE_LIST=NEW_NODE;
+      
+	/* combine FROM and TO clusters */
+	IF ((PTR_TEMP_FROM=ABS_TEMP) | (PTR_CLUST_FROM = PTR_CLUST_TO)) THEN RETURN;
+	
+	CALL COMBINE_CLUSTER;
+   END;
+END;
+
+END DIFF_TEMP_DIFF_HL;
+
+
+COMBINE_CLUSTER: PROCEDURE;
+/* combine  OLD_CLUST into NEW_CLUST and then deallocate OLD_CLUST */
+DECLARE (NEXT,TRAIL) PTR;
+
+/* Delete old_cluster from cluster link list */
+CALL REMOVE_LINK_LIST_ELEMENT(HEAD_CLUSTER,PTR_CLUST_TO);     
+
+/* change cluster pointer in old_cluster link list to point to the new cluster */
+NEXT=PTR_CLUST_TO->TEMP_LIST;
+DO WHILE(NEXT^=NULL);
+   NEXT->CLUSTER=PTR_CLUST_FROM;
+   NEXT=NEXT->NEXT_TEMPLATE;
+END;
+
+/* Merge template link list */
+CALL MERGE_LINK_LIST(PTR_CLUST_FROM->TEMP_LIST,PTR_CLUST_TO->TEMP_LIST);
+
+/* Merge range link list */
+CALL MERGE_LINK_LIST(PTR_CLUST_FROM->RANGE_LIST,PTR_CLUST_TO->RANGE_LIST);
+
+END COMBINE_CLUSTER;
+
+
+MERGE_ALIGNMENT: PROCEDURE(NEW_ALIGNMENT,NEW_LINENUM) RETURNS(BIT(1));
+/* this procedure combines the alignments between TEMP1  and TEMP2. */
+
+DECLARE (NEW_LINENUM,REL_OFFSET) FIXED BINARY(31);
+DECLARE (NEW_ALIGNMENT,TEMPOR_ALIGNMENT) BIT(MAX_ALIGN);
+
+/* calc the relitive offset between the templates */
+REL_OFFSET=MOD(OFFSET,MAX_ALIGN);
+
+
+/* combine the alignments */
+TEMPOR_ALIGNMENT=SUBSTR(PTR_TEMP_TO->ALIGNLIST || PTR_TEMP_TO->ALIGNLIST,1+REL_OFFSET,MAX_ALIGN);
+NEW_ALIGNMENT=TEMPOR_ALIGNMENT & PTR_TEMP_FROM->ALIGNLIST;
+
+if bit_a then
+do;
+   put skip edit(' the relitive offset ', rel_offset)(a,f(10));
+   put skip edit(tempor_alignment,'    ',new_alignment)(b,a,b);
+end;
+
+/* is the new alignment possible????  if no print message and error return */
+IF VERIFY(CHAR(NEW_ALIGNMENT),'0')=0 THEN DO;
+   CALL PRINT_ALIGN_ERROR(PTR_TEMP_FROM->ALIGNLIST,PTR_TEMP_FROM->ALIGN_LINE_NUM,PTR_TEMP_TO->ALIGNLIST,
+	PTR_TEMP_TO->ALIGN_LINE_NUM);
+   PUT  SKIP(2) EDIT('Dump template 1')(a);
+   CALL PRINT_TEMPLATE(PTR_TEMP_FROM,0);
+   PUT  SKIP(2) EDIT('Dump template 2')(a);
+   CALL PRINT_TEMPLATE(PTR_TEMP_TO,0);
+   
+   RETURN(FALSE);  /**************** failure *****************/
+END;
+
+/* figure out the new alignment line number */
+IF  NEW_ALIGNMENT=PTR_TEMP_FROM->ALIGNLIST
+   THEN NEW_LINENUM=PTR_TEMP_FROM->ALIGN_LINE_NUM;
+   ELSE IF NEW_ALIGNMENT=PTR_TEMP_TO->ALIGNLIST 
+      THEN NEW_LINENUM=PTR_TEMP_TO->ALIGN_LINE_NUM;
+      ELSE NEW_LINENUM=LINENUM;
+
+RETURN(TRUE);   /************ success ******************/
+
+END MERGE_ALIGNMENT;
+
+
+
+MERGE_TEMPLATE: PROCEDURE RETURNS(BIT(1));
+/* this routine merges the templates pointed to by TEMP2_PTR AND TEMP1_PTR and returns then new template
+in NEWTEMPLATE  and other info in NUM_INST, LAST_INST   */
+
+DECLARE (CON_LOC,NUM_INST,LAST_INST,PLOW,NEW_LINENUM) FIXED BINARY(31);
+DECLARE (TEMPLATE1,TEMPLATE2,NEWTEMPLATE) BIT(MAX_ADDR);
+DECLARE (INST_POINT,NEXT,LARGE_TEMP1,LARGE_TEMP2) PTR;
+DECLARE NEW_ALIGNMENT BIT(MAX_ALIGN);
+
+IF ^MERGE_ALIGNMENT(NEW_ALIGNMENT,NEW_LINENUM) THEN RETURN(FALSE);
+
+/* calc the last instruction and the number on instructions in the new template */
+LAST_INST=MAX(OFFSET+PTR_TEMP_TO->LAST_ONE,PTR_TEMP_FROM->LAST_ONE);
+NUM_INST=PTR_TEMP_TO->NUM_ONES + PTR_TEMP_FROM->NUM_ONES;
+
+/* Get pointers to large size template if they exists */
+LARGE_TEMP1=PTR_TEMP_FROM->TEMPLATE;
+LARGE_TEMP2=PTR_TEMP_TO->TEMPLATE;
+
+/* check the last inst to make sure it didn't slip out side the max addressing space size */
+IF LAST_INST > (MAX_ADDR - 1) THEN DO;
+   PUT SKIP(2) EDIT('*** ERROR ... constraint from .MCR line number ', linenum, ' forces instruction out of programs ')(a,f(8),a);
+   put skip(2) edit('              maximun addressing space of ',max_addr-1,'.')(a,f(8),a);
+   RETURN(FALSE);
+END;
+
+/* get first template string to combine */
+IF PTR_TEMP_FROM->TEMPLATE=NULL 
+   THEN SUBSTR(TEMPLATE1,1,LAST_INST+1)=PTR_TEMP_FROM->SMALL_STRING;
+   ELSE SUBSTR(TEMPLATE1,1,LAST_INST+1)=SUBSTR(LARGE_TEMP1->TEMP_STR,1,LAST_INST+1);
+
+/* get second template string to combine */
+IF PTR_TEMP_TO->TEMPLATE=NULL 
+   THEN SUBSTR(TEMPLATE2,1,LAST_INST+1)=PTR_TEMP_TO->SMALL_STRING;
+   ELSE SUBSTR(TEMPLATE2,1,LAST_INST+1)=SUBSTR(LARGE_TEMP2->TEMP_STR,1,LAST_INST+1);
+
+/* check for conflicting entries */
+NEWTEMPLATE=SUBSTR(TEMPLATE1,OFFSET+1,LAST_INST-OFFSET+1) & SUBSTR(TEMPLATE2,1,LAST_INST-OFFSET+1);
+
+/* if conflicting entries print error message */
+IF (((SUBSTR(NEWTEMPLATE,1,LAST_INST-OFFSET+1)^='0'B)) &  ((^KILL_ERROR_MESS))) THEN DO;
+   /* ERROR */
+    
+   CON_LOC=INDEX(NEWTEMPLATE,'1'B);
+   IF ((^SUBSTR(FAKE_TEMP,CON_LOC+OFFSET,1)) & (PTR_TEMP_FROM = ABS_TEMP)) | (PTR_TEMP_FROM ^= ABS_TEMP) THEN DO;
+   	PUT  SKIP EDIT('***WARNING-- 2 instructions must occupy the same location .... constraint from LINE: ',linenum)(A,f(7));
+   	PUT SKIP LIST(' 2 Instructions ARE mapped to the SAME location');
+   	CALL RLS_DUMP_ONE_CLUSTER(PTR_TEMP_FROM->CLUSTER);
+   	PLOW=CON_LOC-64;
+   	CALL PRINT_TEMPLATE(PTR_TEMP_FROM,OFFSET+PLOW);
+   	CALL PRINT_TEMPLATE(PTR_TEMP_TO,PLOW);
+    END;
+END;
+
+/* create the new template */
+NEWTEMPLATE=SUBSTR(TEMPLATE1,1,OFFSET) || (SUBSTR(TEMPLATE1,OFFSET+1,LAST_INST-OFFSET+1) 
+                                          | SUBSTR(TEMPLATE2,1,LAST_INST-OFFSET+1));
+
+
+/* TAKE old template out of link list */
+NEXT=PTR_TEMP_TO->CLUSTER;
+CALL REMOVE_LINK_LIST_ELEMENT(NEXT->TEMP_LIST,PTR_TEMP_TO);     
+
+/* update info of instructions in old template to point to the new template */
+INST_POINT=PTR_TEMP_TO->INST_LIST;
+DO WHILE(INST_POINT^=NULL);
+   INST_POINT->TEMP_NODE=PTR_TEMP_FROM;
+   INST_POINT->TEMP_POS = INST_POINT->TEMP_POS + OFFSET;
+   INST_POINT=INST_POINT->NEXT_INST;
+END;
+
+
+PTR_INST_TO->TEMP_LINE_NUM=LINENUM;
+PTR_INST_FROM->TEMP_LINE_NUM=LINENUM;
+
+/* put updated info in new template node */
+PTR_TEMP_FROM->LAST_ONE=LAST_INST;   
+PTR_TEMP_FROM->NUM_ONES=NUM_INST;
+PTR_TEMP_FROM->ALIGNLIST=NEW_ALIGNMENT;
+PTR_TEMP_FROM->ALIGN_LINE_NUM=NEW_LINENUM;
+
+/* merge instruction link list */
+CALL MERGE_LINK_LIST(PTR_TEMP_FROM->INST_LIST,PTR_TEMP_TO->INST_LIST);
+
+/*  put new template into the proper template string (small or large types) */
+IF LAST_INST+1>SMALL_TEMPLATE THEN 
+DO;
+   IF PTR_TEMP_FROM->TEMPLATE=NULL THEN DO;
+      ALLOCATE TEMP_STRING SET(NEW_STRING1);
+      PTR_TEMP_FROM->TEMPLATE=NEW_STRING1;
+   END;
+
+   SUBSTR(PTR_TEMP_FROM->TEMPLATE->TEMP_STR,1,LAST_INST+1)=NEWTEMPLATE;
+END;
+
+ELSE SUBSTR(PTR_TEMP_FROM->SMALL_STRING,1,LAST_INST+1)=NEWTEMPLATE;
+
+RETURN(TRUE);
+
+END MERGE_TEMPLATE;
+     
+
+
+FIND_RANGE: PROCEDURE(PTR_TEMP_FROM,PTR_TEMP_TO,RANGELIST,RANGE_POINT) RETURNS(BIT(1));
+/* this routine finds a range constraint between FROM and TO if it exists.  RANGE_POINT will point to
+   this constraint if it exsists upon return.
+     PTR_TEMP_FROM,PTR_TEMP_TO      templates that FROM and TO are in 
+     RANGELIST                      is list of range constraints to search 
+     RANGE_POINT                    will point to contraint between FROM and TO if it exists */
+
+DECLARE (NEXT,PTR_TEMP_FROM,PTR_TEMP_TO,RANGELIST,RANGE_POINT) PTR;
+
+/* search RANGELIST link list */
+NEXT=RANGELIST;
+DO WHILE(NEXT^=NULL);
+   IF (NEXT->TEMP1_ADR=PTR_TEMP_FROM & NEXT->TEMP2_ADR=PTR_TEMP_TO) |
+             (NEXT->TEMP2_ADR=PTR_TEMP_FROM & NEXT->TEMP1_ADR=PTR_TEMP_TO)
+   THEN DO;
+      RANGE_POINT=NEXT;
+      RETURN(TRUE);  /* Range constraint found  **** success **** */
+   END;
+   NEXT=NEXT->NEXT_RANGE_NODE;
+END;
+
+RETURN(FALSE);  /* range constraint not found   ***** failure **** */
+END FIND_RANGE;
+
+
+CHANGE_RANGE: PROCEDURE(RANGE_POINT,PTR_FROM,PTR_TO,NEW_HIGH,NEW_LOW,LINE_H,LINE_L,LINENUM) RETURNS(BIT(1));
+/* This procedure changes the range constraint pointed by RANGE_POINT  using NEW_HIGH
+   and NEW_LOW constraints only if this leave a possible range constraint */
+DECLARE (RANGE_POINT,PTR_FROM,PTR_TO) PTR;
+DECLARE (NEW_HIGH,NEW_LOW,LINE_H,LINE_L,LINENUM) FIXED BINARY(31);
+
+IF RANGE_POINT->TEMP1_ADR = PTR_FROM THEN DO;
+   IF DO_CHANGE_RANGE(RANGE_POINT,PTR_FROM,PTR_TO,NEW_HIGH,NEW_LOW,LINE_H,LINE_L,LINENUM) THEN RETURN(TRUE);
+      ELSE RETURN(FALSE);
+END;
+
+ELSE IF DO_CHANGE_RANGE(RANGE_POINT,PTR_TO,PTR_FROM,-NEW_LOW,-NEW_HIGH,LINE_L,LINE_H,LINENUM) THEN RETURN(TRUE);
+    ELSE RETURN(FALSE);
+
+END CHANGE_RANGE;
+
+
+DO_CHANGE_RANGE: PROCEDURE(RANGE_POINT,PTR_FROM,PTR_TO,NEW_HIGH,NEW_LOW,LINE_H,LINE_L,LINENUM) RETURNS(BIT(1));
+/* This procedure changes the range constraint pointed by RANGE_POINT  using NEW_HIGH
+   and NEW_LOW constraints only if this leave a possible range constraint */
+DECLARE (RANGE_POINT,PTR_FROM,PTR_TO) PTR;
+DECLARE (NEW_HIGH,NEW_LOW,LINE_H,LINE_L,LINENUM) FIXED BINARY(31);
+
+/* check that result constraint could be satisfied...if not ignore NEW_HIGH and NEW_LOW */
+IF MIN(NEW_HIGH,RANGE_POINT->HIGH)  <  MAX(NEW_LOW,RANGE_POINT->LOW) THEN DO;
+   PUT  SKIP EDIT('*** ERROR, branch between two groups of instructions that are too far apart. ')(a);
+   PUT  SKIP EDIT('    Branch constraint that cannot be satisfied is from LINE ',linenum,'and is the following:')
+		(a,f(7),a);
+   PUT  SKIP EDIT('		Distance between instruction groups must be in range from ',NEW_LOW, ' to ', new_high)
+	(A,F(7),A,F(7),A,F(7),A,F(7));
+
+  PUT  SKIP EDIT('  Previous branch constraints between instruction groups put range from ',RANGE_POINT->LOW,' to ',
+     RANGE_POINT->HIGH,'.')(a,f(7),a,f(7));
+
+  PUT SKIP EDIT('   Previous constraints are from LINEs ',RANGE_POINT->LOW_LINE_NUM,' and ', /* RLS ??? */
+	RANGE_POINT->HIGH_LINE_NUM)(A,F(7),A,F(7));
+
+
+   put  skip(2) edit('Instruction group from:')(a);
+   call PRINT_TEMPLATE(ptr_from,0);
+
+   put  skip(2) edit('Instruction group to:')(a);
+   call PRINT_TEMPLATE(ptr_to,0);
+
+CALL RLS_DUMP_ONE_CLUSTER(PTR_FROM->CLUSTER);
+
+   RETURN(FALSE);
+END;
+
+/* change high constraint if needed */
+IF NEW_HIGH < RANGE_POINT->HIGH THEN DO;
+   RANGE_POINT->HIGH=NEW_HIGH;
+   RANGE_POINT->HIGH_LINE_NUM=LINE_H;
+END;
+    
+/* change low constraint if needed */
+IF NEW_LOW > RANGE_POINT->LOW THEN DO;
+   RANGE_POINT->LOW=NEW_LOW;
+   RANGE_POINT->LOW_LINE_NUM=LINE_L;
+END;
+
+RETURN(TRUE);
+
+END DO_CHANGE_RANGE;
+
+
+MERGE_RANGE: PROCEDURE(NEW_LIST);
+/* this procedure takes range nodes from the OLD_LIST  and puts it on the NEW_LIST only if it
+   is consistant.    Also if the node taken from the OLD_LIST in on OLD_NAME template then
+   the range constraint is change to a constraint on NEW_NAME  using OFFSET before checking it
+   with elements on the NEW_LIST */
+
+DECLARE (NEXT,R_POINT,NEW_LIST) PTR;
+
+IF PTR_CLUST_FROM ^= PTR_CLUST_TO THEN DO;
+	CALL RENAME_RANGE(PTR_TEMP_TO,PTR_TEMP_FROM,PTR_CLUST_TO->RANGE_LIST);
+	CALL MERGE_LINK_LIST(PTR_CLUST_FROM->RANGE_LIST,PTR_CLUST_TO->RANGE_LIST);
+END;
+ELSE CALL RENAME_RANGE(PTR_TEMP_TO,PTR_TEMP_FROM,PTR_CLUST_FROM->RANGE_LIST);
+
+CALL MUNGE_RANGE(NEW_LIST,PTR_CLUST_FROM->RANGE_LIST);
+
+PTR_CLUST_FROM->RANGE_LIST=NULL;
+
+END MERGE_RANGE;
+
+
+MUNGE_RANGE: PROCEDURE(NEW_LIST,OLD_LIST);
+DECLARE (OLD_NEXT,NEXT,NEW_NODE,OLD_LIST,NEW_LIST,RANGE_POINT) PTR;
+
+NEW_LIST=NULL;
+
+OLD_NEXT=OLD_LIST;
+
+DO WHILE(OLD_NEXT^=NULL);
+   NEXT=OLD_NEXT;
+   OLD_NEXT=OLD_NEXT->NEXT_RANGE_NODE;
+
+   /* If range constraint is between the same template then check that 0 offset is ok then return */
+   IF NEXT->TEMP2_ADR=NEXT->TEMP1_ADR THEN DO;
+      IF ^(NEXT->HIGH>=0 & NEXT->LOW<=0) THEN DO;
+             PUT  SKIP EDIT('*** ERROR, branches between two instructions can not be satisfied.')(a);
+             PUT  SKIP EDIT('   Branches are from LINEs ',NEXT->HIGH_LINE_NUM,' and ',NEXT->LOW_LINE_NUM)(a,f(7),a,f(7));
+             PUT  SKIP EDIT('   Current constraint is from LINE ',linenum,' and is ignored')(a,f(7),a);
+CALL RLS_DUMP_ONE_CLUSTER(NEXT->TEMP1_ADR->CLUSTER);
+          END;
+   END;
+   ELSE DO;
+      IF FIND_RANGE(NEXT->TEMP1_ADR,NEXT->TEMP2_ADR,NEW_LIST,RANGE_POINT) THEN DO;
+         IF ^CHANGE_RANGE(RANGE_POINT,NEXT->TEMP1_ADR,NEXT->TEMP2_ADR,NEXT->HIGH,NEXT->LOW,
+                           NEXT->HIGH_LINE_NUM,NEXT->LOW_LINE_NUM,LINENUM)
+                      THEN DO;
+			LINENUM=LINENUM;
+                      END;
+      END;
+
+      ELSE DO;
+         NEXT->NEXT_RANGE_NODE=NEW_LIST;
+	 IF NEW_LIST^=NULL THEN
+	   NEW_LIST->PRIOR_RANGE_NODE=NEXT;
+         NEW_LIST=NEXT;
+      END;
+   END;
+END;
+
+END MUNGE_RANGE;
+
+
+RENAME_RANGE: PROCEDURE(OLD_NAME,NEW_NAME,THE_NEW_LIST);
+/* scans THE_NEW_LIST and changes OLD_NAME to NEW_NAME in range constraints */
+DECLARE (NEXT,OLD_NAME,NEW_NAME,THE_NEW_LIST) PTR;
+
+NEXT=THE_NEW_LIST;
+
+DO WHILE(NEXT^=NULL);
+   IF NEXT->TEMP1_ADR=OLD_NAME THEN DO;
+      NEXT->TEMP1_ADR=NEW_NAME;
+      NEXT->HIGH=NEXT->HIGH + OFFSET;
+      NEXT->LOW=NEXT->LOW  +  OFFSET;
+   END;
+
+   IF NEXT->TEMP2_ADR=OLD_NAME THEN DO;
+      NEXT->TEMP2_ADR=NEW_NAME;
+      NEXT->HIGH=NEXT->HIGH - OFFSET;
+      NEXT->LOW=NEXT->LOW   - OFFSET;
+   END;
+
+   NEXT=NEXT->NEXT_RANGE_NODE;
+END;
+
+END RENAME_RANGE;
+
+
+ALLOCATE_RANGE: PROCEDURE(TEMP1,TEMP2,NEW_HIGH,NEW_LOW,LINE_NUM_HIGH,LINE_NUM_LOW,NEW_NODE);
+/* This procedure creates a new range constraint node with the information passed to it */
+   
+DECLARE (TEMP1,TEMP2,NEW_NODE) PTR;
+DECLARE (NEW_HIGH,NEW_LOW,LINE_NUM_HIGH,LINE_NUM_LOW) FIXED BINARY(31);
+
+ALLOCATE RANGE_NODE SET(NEW_RANGE);
+   NEW_RANGE->TEMP1_ADR=TEMP1;
+   NEW_RANGE->TEMP2_ADR=TEMP2;
+   NEW_RANGE->LOW=NEW_LOW;
+   NEW_RANGE->HIGH=NEW_HIGH;
+   NEW_RANGE->HIGH_LINE_NUM=LINE_NUM_HIGH;
+   NEW_RANGE->LOW_LINE_NUM=LINE_NUM_LOW;
+ 
+NEW_NODE=NEW_RANGE;
+
+END ALLOCATE_RANGE;
+
+
+REMOVE_LINK_LIST_ELEMENT: PROCEDURE(HEAD_LIST,OLD_NODE);
+/* removes an element from a link list */
+DECLARE (NEXT,TRAIL,HEAD_LIST,OLD_NODE,FAKE_PTR) PTR;
+DECLARE 1 FAKE_NODE BASED(FAKE_PTR),
+          2  FAKE_NEXT_ELEMENT PTR,
+          2  FAKE_PRIOR_ELEMENT PTR;
+
+IF HEAD_LIST=OLD_NODE THEN DO;
+   HEAD_LIST=OLD_NODE->FAKE_NEXT_ELEMENT;
+   IF HEAD_LIST^=NULL THEN 
+     HEAD_LIST->FAKE_PRIOR_ELEMENT=NULL;
+END;
+ELSE DO;
+   NEXT=OLD_NODE->FAKE_NEXT_ELEMENT;
+   TRAIL=OLD_NODE->FAKE_PRIOR_ELEMENT;
+   TRAIL->FAKE_NEXT_ELEMENT=NEXT;
+   IF NEXT^=NULL THEN 
+     NEXT->FAKE_PRIOR_ELEMENT=TRAIL;
+
+END;
+
+END REMOVE_LINK_LIST_ELEMENT;
+
+
+MERGE_LINK_LIST: PROCEDURE(NEW_LIST,OLD_LIST);
+/* merges NEW_LIST and OLD_LIST into NEW_LIST.  */
+DECLARE (NEXT,JUNK,TRAIL,NEW_LIST,OLD_LIST) PTR;
+DECLARE 1 NODE_JUNK BASED(JUNK),
+          2 NEXT_NODE PTR,
+          2 PRIOR_NODE PTR;
+
+IF NEW_LIST=NULL THEN DO;
+  NEW_LIST=OLD_LIST;
+  RETURN;
+END;
+
+IF OLD_LIST=NULL THEN RETURN;
+
+NEXT=NEW_LIST;
+DO WHILE(NEXT^=NULL);
+   TRAIL=NEXT;
+   NEXT=NEXT->NEXT_NODE;
+END;
+
+TRAIL->NEXT_NODE=OLD_LIST;
+OLD_LIST->PRIOR_NODE=TRAIL;
+
+END MERGE_LINK_LIST;
+
+
+ALIGNMENT_TYPE: PROCEDURE;
+/* This procedure handles alignment type instruction */
+DECLARE (OFFSET,ALIGNMENT) FIXED BINARY(31);
+DECLARE NEW_ALIGN BIT(MAX_ALIGN);
+DECLARE (INST_POINT,TEMP_POINT) PTR;
+DECLARE POSITION FIXED BINARY(31);
+DECLARE (TEMPORARY,TEMP_ALIGN) BIT(MAX_ALIGN);
+
+IF INST_INFO(TO)=NULL THEN CALL CREATE_CLUSTER(TO);   /* create cluster if FROM has not been seen yet */
+
+IF ALIGNMENT=0 THEN RETURN;                                       /* fast out for trival alignment */
+
+OFFSET=LOW_EXT;
+ALIGNMENT=HIGH_EXT;
+
+NEW_ALIGN='0'B;
+INST_POINT=INST_INFO(TO);                       /* set up pointers to the instruction info */
+TEMP_POINT=INST_POINT->TEMP_NODE;
+
+POSITION=MOD(INST_POINT->TEMP_POS,MAX_ALIGN);     /* get the interesting part of the position */
+OFFSET=MOD(OFFSET,MAX_ALIGN);                     /* get the insteresting part of the offset */
+
+CALL CREATE_ALIGN_STRING(ALIGNMENT,NEW_ALIGN);   /* create bit vector for new alignment string */
+
+TEMP_ALIGN=SUBSTR(NEW_ALIGN||NEW_ALIGN||NEW_ALIGN,1+MAX_ALIGN-OFFSET+POSITION,MAX_ALIGN);   /* rotate the alignment according to
+                                                                                    offset and the position of the instruction */
+TEMPORARY=TEMP_POINT->ALIGNLIST & TEMP_ALIGN;  /* AND existing alignment with new alignment string */
+
+IF TEMPORARY='0'B THEN DO;    /* check that resulting alignment string is feasible */
+   CALL PRINT_ALIGN_ERROR(TEMP_ALIGN,LINENUM,TEMP_POINT->ALIGNLIST,TEMP_POINT->ALIGN_LINE_NUM);
+   PUT  SKIP(2) EDIT('template alignment is on following instruction group:')(a);
+   CALL PRINT_TEMPLATE(TEMP_POINT,0);
+   RETURN;
+END;
+
+TEMP_POINT->ALIGN_LINE_NUM = LINENUM;   /* set line number is alignment changes */
+TEMP_POINT->ALIGNLIST=TEMPORARY;        /* store new alignment string */
+
+END ALIGNMENT_TYPE;
+
+PRINT_ALIGN_ERROR: PROCEDURE(ALIGN1,LINENUM1,ALIGN2,LINENUM2);
+DECLARE (ALIGN1,ALIGN2) BIT(MAX_ALIGN);
+DECLARE (LINENUM1,LINENUM2) FIXED BINARY(31);
+
+/* ERROR NO POSSIBLE ALIGNMENT */
+PUT  SKIP EDIT('*** impossible alignment.  The ANDing of align1 from LINE: ',linenum1,
+             ' and align2 from LINE: ',linenum2,' gives no possible alignment.')(a,f(7),a,f(7),a);
+
+PUT  SKIP EDIT('ALIGN1: ',TRANSLATE(CHAR(ALIGN1),'.1','01')) (A,A);
+PUT  SKIP EDIT('ALIGN2: ',TRANSLATE(CHAR(ALIGN2),'.1','01')) (A,A);
+
+END PRINT_ALIGN_ERROR;
+
+
+CREATE_ALIGN_STRING: PROCEDURE(ALIGNMENT,NEW_ALIGN);
+/* this procedure creates an alignment template(NEW_ALIGN) using ALIGNMENT as a base three number
+   that represents the micro2 alignment string 
+            '*'   =    0
+            '0'   =    1
+            '1'   =    2                */
+
+DECLARE (ALIGNMENT) FIXED BINARY(31);
+DECLARE NEW_ALIGN BIT(MAX_ALIGN);
+DECLARE (POS_ALIGN,REMAINDER,I,RESIDUE,ONE_MASK,OR_MASK,INC_MASK) FIXED BINARY(31);
+
+IF BIT_A THEN PUT LIST(ALIGNMENT);
+RESIDUE=ALIGNMENT;
+OR_MASK=0;
+INC_MASK=0;
+
+/* decode alignment string to lowest valid alignment (INC_MASK),  
+   ones positions in alignment string (ONE_MASK),
+   zero positions in alignment string (OR_MASK)       */
+DO I=0 TO ALIGN_STRING_SIZE-1;
+   REMAINDER=MOD(RESIDUE,3);
+   RESIDUE=DIVIDE(RESIDUE-REMAINDER,3,31);
+   
+   IF REMAINDER=1 THEN OR_MASK=2**I + OR_MASK;
+
+   IF REMAINDER=2 THEN INC_MASK=2**I + INC_MASK;
+END;
+
+ONE_MASK=INC_MASK;
+
+
+IF BIT_A THEN PUT LIST(OR_MASK,INC_MASK);
+/* if residue not zero the significant part of alignment lost */
+IF RESIDUE>0 THEN DO;
+   PUT  SKIP EDIT('*** Alignment specified above max alignment of ',
+                  max_align,' at LINE ',linenum)(A,f(7),a,f(7));
+END;
+
+/* loop does a count up of the '*' positions in the alignment string */
+DO WHILE(INC_MASK<MAX_ALIGN);
+   SUBSTR(NEW_ALIGN,INC_MASK+1,1)='1'B;
+   INC_MASK=BINARY( (BIT(BINARY(BIT(INC_MASK,31)|BIT(OR_MASK,31),31)+1,31)& (^BIT(OR_MASK,31)))|BIT(ONE_MASK,31),31);   
+END;
+
+END CREATE_ALIGN_STRING;
+
+
+BLOCK_TYPE: PROCEDURE;
+/* this procedure puts the block constraint into the proper block constraint list in
+   the block constraint  structure */
+DECLARE (BLOCK) FIXED BINARY(31);
+DECLARE (NEXT2,NEXT,BLIST_FROM,BLIST_TO,BLOCK_NODE_FROM,BLOCK_NODE_TO,POINT_TO,POINT_FROM) PTR;
+
+IF BIT_B THEN DO;
+   NEXT = BLOCK_LIST_HEAD;
+
+   DO WHILE(NEXT^=NULL);
+	NEXT2 = NEXT->BLOCK_LIST;
+	PUT SKIP(2) LIST('START NEW BLOCK');
+	DO WHILE(NEXT2^=NULL);
+	   PUT EDIT(NEXT2->M2_INST_NUM)(F(8));
+	   NEXT2=NEXT2->NEXT_BLOCK;
+	END;
+
+	NEXT= NEXT->NEXT_BLOCK_LIST;
+   END;
+END;   
+
+
+/* create cluster for FROM and TO instructions if they haven't been seen in the contraint
+    file yet   */
+IF INST_INFO(FROM)=NULL THEN CALL CREATE_CLUSTER(FROM);
+IF INST_INFO(TO)=NULL THEN CALL CREATE_CLUSTER(TO);
+
+BLOCK=LOW_EXT;
+
+POINT_FROM=INST_INFO(FROM);
+POINT_TO=INST_INFO(TO);
+
+
+/* create block contraint node if it doesn't already exsist */
+IF POINT_FROM->BLOCK_LIST_PTR = NULL THEN CALL CREATE_BLOCK_NODE(FROM,POINT_FROM,LINENUM);
+IF POINT_TO->BLOCK_LIST_PTR = NULL THEN CALL CREATE_BLOCK_NODE(TO,POINT_TO,LINENUM);
+
+BLIST_FROM=POINT_FROM->BLOCK_LIST_PTR;
+BLIST_TO=POINT_TO->BLOCK_LIST_PTR;
+
+BLOCK_NODE_TO=POINT_TO->BLOCK_NODE_PTR;
+BLOCK_NODE_FROM=POINT_FROM->BLOCK_NODE_PTR;
+
+IF BLOCK_SIZE^=BLOCK THEN DO;
+   PUT  EDIT('*** WARNING...program only handles one size of block.  Block size is: ',BLOCK_SIZE,
+                          ' Inputted block size is: ',block)(A,F(9),A,F(9));
+   PUT  EDIT('    constraint ignored from LINE: ',linenum)(a,f(9));
+   RETURN;
+END;
+
+IF (BLIST_FROM = BLIST_TO) THEN RETURN;     /* Already in same block by earlier constraints */
+
+/* change pointer in instruction info block to point to new list */
+NEXT = BLIST_TO->BLOCK_LIST;
+DO WHILE(NEXT^=NULL);
+	INST_INFO(NEXT->M2_INST_NUM)->BLOCK_LIST_PTR=BLIST_FROM;
+	NEXT=NEXT->NEXT_BLOCK;
+END;
+
+/* change line numbers where constraint is from */
+BLOCK_NODE_TO->LINE_NUM=LINENUM;
+BLOCK_NODE_FROM->LINE_NUM=LINENUM;
+
+/* combine the block lists of the two instructions */
+CALL REMOVE_LINK_LIST_ELEMENT(BLOCK_LIST_HEAD,BLIST_TO);
+FREE BLIST_TO->BLOCK_LIST_NODE;
+CALL MERGE_LINK_LIST(BLIST_FROM->BLOCK_LIST,BLIST_TO->BLOCK_LIST);
+
+IF BIT_B THEN DO;
+   NEXT = BLOCK_LIST_HEAD;
+
+   DO WHILE(NEXT^=NULL);
+	NEXT2 = NEXT->BLOCK_LIST;
+	PUT SKIP(2) LIST('START NEW BLOCK');
+	DO WHILE(NEXT2^=NULL);
+	   PUT EDIT(NEXT2->M2_INST_NUM)(F(8));
+	   NEXT2=NEXT2->NEXT_BLOCK;
+	END;
+
+	NEXT= NEXT->NEXT_BLOCK_LIST;
+   END;
+END;   
+
+END BLOCK_TYPE;
+
+
+CREATE_BLOCK_NODE: PROCEDURE(M2_INST,M2_INST_PTR,LINENUM);
+/* This procedure creates a block node and list for the micro two instruction M2_INST */
+DECLARE (M2_INST,LINENUM) FIXED BINARY(31);
+DECLARE M2_INST_PTR PTR;
+
+ALLOCATE BLOCK_NODE SET(NEW_BLOCK);
+   NEW_BLOCK->LINE_NUM=LINENUM;
+   NEW_BLOCK->M2_INST_NUM=M2_INST;
+   NEW_BLOCK->NEXT_BLOCK=NULL;
+   NEW_BLOCK->PRIOR_BLOCK=NULL;
+
+ALLOCATE BLOCK_LIST_NODE SET(NEW_BLOCK_LIST);
+   NEW_BLOCK_LIST->BLOCK_LIST=NEW_BLOCK;
+   NEW_BLOCK_LIST->NEXT_BLOCK_LIST=BLOCK_LIST_HEAD;
+   IF BLOCK_LIST_HEAD^=NULL THEN
+     BLOCK_LIST_HEAD->PRIOR_BLOCK_LIST=NEW_BLOCK_LIST;
+
+   BLOCK_LIST_HEAD=NEW_BLOCK_LIST;
+
+M2_INST_PTR->BLOCK_LIST_PTR=NEW_BLOCK_LIST;
+M2_INST_PTR->BLOCK_NODE_PTR=NEW_BLOCK;
+
+END CREATE_BLOCK_NODE;
+
+
+CREATE_CLUSTER: PROCEDURE(M2_INST);
+/* This routine creates a new cluster for micro2 address "M2_INST".  This routine would
+    be called the first time M2_INST is seen in the constraint file or when initializing 
+    the data structure       */
+DECLARE (M2_INST) FIXED BINARY(31);  /* holds micro2 instruction number of instruction to be allocated
+                                      into a cluster */
+
+/* initialize the template node */
+ALLOCATE TEMPLATE_NODE SET(NEW_TEMPLATE);
+	NEW_TEMPLATE->NEXT_TEMPLATE=NULL;
+	NEW_TEMPLATE->PRIOR_TEMPLATE=NULL;
+	NEW_TEMPLATE->TEMPLATE=NULL;
+	NEW_TEMPLATE->TEMP_VAL=-777;
+	NEW_TEMPLATE->ALIGNLIST='0'B;
+	NEW_TEMPLATE->ALIGNLIST=^NEW_TEMPLATE->ALIGNLIST;
+	NEW_TEMPLATE->LAST_ONE=0;
+	NEW_TEMPLATE->NUM_ONES=1;
+	NEW_TEMPLATE->ABS_HIGH=MAX_ADDR;
+	NEW_TEMPLATE->ABS_LOW=-MAX_ADDR;
+	NEW_TEMPLATE->BACKTRACK_BOUND=0;
+	NEW_TEMPLATE->SMALL_STRING='0'B;
+	SUBSTR(NEW_TEMPLATE->SMALL_STRING,1,1)='1'B;
+	NEW_TEMPLATE->ALIGN_LINE_NUM=LINENUM;
+	NEW_TEMPLATE->TEMP_NUM=M2_INST;
+
+/* initialize the cluster node */
+ALLOCATE CLUSTER_NODE SET(NEW_CLUSTER);
+	NEW_CLUSTER->NEXT_CLUSTER=HEAD_CLUSTER;
+	IF HEAD_CLUSTER^=NULL THEN
+	  HEAD_CLUSTER->PRIOR_CLUSTER=NEW_CLUSTER;
+	HEAD_CLUSTER=NEW_CLUSTER;
+	NEW_CLUSTER->TEMP_LIST=NEW_TEMPLATE;
+	NEW_CLUSTER->CLUST_NUM=M2_INST;
+	NEW_CLUSTER->CLUST_VAL=-777;
+	NEW_CLUSTER->RANGE_LIST=NULL;
+		
+	NEW_TEMPLATE->CLUSTER=NEW_CLUSTER;
+
+/* put in the initial range constraint that says instruction must be in addressing space */
+ALLOCATE RANGE_NODE SET(NEW_RANGE);
+	NEW_RANGE->TEMP1_ADR=ABS_TEMP;
+	NEW_RANGE->TEMP2_ADR=NEW_TEMPLATE;
+	NEW_RANGE->HIGH=MAX_ADDR-1;
+	NEW_RANGE->LOW=0;
+	NEW_RANGE->HIGH_LINE_NUM=LINENUM;
+	NEW_RANGE->LOW_LINE_NUM=LINENUM;
+	NEW_RANGE->NEXT_RANGE_NODE=NULL;
+	NEW_RANGE->PRIOR_RANGE_NODE=NULL;
+	
+	NEW_CLUSTER->RANGE_LIST=NEW_RANGE;
+
+
+/* initialize the instruction list node for "M2_INST" */
+ALLOCATE INST_LIST_NODE SET(INST_PTR);
+	INST_PTR->NEXT_INST=NULL;
+	INST_PTR->PRIOR_INST=NULL;
+	INST_PTR->INST=M2_INST;
+	INST_PTR->TEMP_NODE=NEW_TEMPLATE;
+	INST_PTR->TEMP_POS=0;
+	INST_PTR->BLOCK_NODE_PTR=NULL;
+	INST_PTR->BLOCK_LIST_PTR=NULL;
+	INST_PTR->TEMP_LINE_NUM=LINENUM;
+	
+	NEW_TEMPLATE->INST_LIST=INST_PTR;
+
+INST_INFO(M2_INST)=INST_PTR;
+
+END CREATE_CLUSTER;
+
+
+ALLOCATE_WORLD: PROCEDURE;
+DECLARE CLUST_POINT PTR;
+DECLARE NEW_NEXT_CLUSTER PTR;
+DECLARE PASS_NO FIXED BINARY(31);
+
+PASS_NO = 0;
+CLUST_POINT=HEAD_CLUSTER;
+
+DO WHILE(CLUST_POINT^=NULL);
+   IF BIT_A THEN PUT SKIP LIST('IN ALLOCATE WORLD');
+   IF BIT_HAT THEN PUT SKIP LIST('pass ',PASS_NO);
+
+   IF ^ALLOC_CLUSTER(CLUST_POINT,OLD_ALLOC) THEN DO;
+       PUT  SKIP EDIT('*** world can not be allocated')(a);
+       RETURN;
+   END;
+
+   CLUST_POINT=CLUST_POINT->NEXT_CLUSTER;    /* pass by cluster just allocated */
+
+   CALL ABS_RANGE_WORLD(CLUST_POINT);
+   CALL TOTAL_VALUE_ALL(CLUST_POINT);
+   CALL FIND_HARDEST(CLUST_POINT);
+   IF BIT_Y THEN CALL DUMP_WORLD('11111111'B);   
+
+   IF INDEX(DEBUG,'@')^=0 & PASS_NO >= DEBUG_N*5 THEN
+      DO;
+	CALL RLS_DUMP_CLUSTERS(CLUST_POINT);
+      END;
+   IF INDEX(DEBUG,'D')^=0 THEN
+	CALL DUMP_OLD_ALLOC(OLD_ALLOC);
+   PASS_NO = PASS_NO + 1;
+END;
+
+CALL OUTPUT_ADR_FILE;
+
+END ALLOCATE_WORLD;
+
+
+FIND_HARDEST: PROCEDURE(CLUST_POINT);
+
+DECLARE (CLUST_POINT,HARDEST,NEXT) PTR;
+DECLARE (CUR_MIN) FIXED BINARY(31);
+
+NEXT=CLUST_POINT;
+HARDEST=NULL;
+CUR_MIN=999999999;
+
+DO WHILE(NEXT^=NULL);
+   IF NEXT->CLUST_VAL < CUR_MIN THEN DO;
+	HARDEST=NEXT;
+	CUR_MIN=NEXT->CLUST_VAL;
+   END;
+
+   NEXT=NEXT->NEXT_CLUSTER;
+END;
+
+IF HARDEST=NULL THEN  DO; 
+   CLUST_POINT=NULL;  
+   RETURN;  
+END;
+
+IF HARDEST=CLUST_POINT THEN DO;
+   CLUST_POINT=HARDEST;
+   RETURN;
+END;
+
+CALL REMOVE_LINK_LIST_ELEMENT(HEAD_CLUSTER, HARDEST);
+
+HARDEST->PRIOR_CLUSTER = CLUST_POINT->PRIOR_CLUSTER;
+HARDEST->NEXT_CLUSTER = CLUST_POINT;
+
+CLUST_POINT->PRIOR_CLUSTER->NEXT_CLUSTER=HARDEST;
+CLUST_POINT->PRIOR_CLUSTER=HARDEST;
+
+CLUST_POINT=HARDEST;
+
+END FIND_HARDEST;
+
+
+OUTPUT_ADR_FILE: PROCEDURE;
+/* This routine calculates the absolute address of each micro 2 instruction and then
+   output it to the .ADR file */
+DECLARE DONE BIT(1);
+DECLARE (INST_INFO_PTR,TEMP_OF_INST_PTR) PTR;
+DECLARE (CACA1,CACA2,CACA3,I,INSTRUCTION_POSITION) FIXED BINARY(31);
+ON ENDFILE(adr_infile) DONE=TRUE;
+
+PUT SKIP EDIT('OPENING OUTPUT FILE '||FILE_NAME||'.BDR')(A);
+OPEN FILE(ADR_OUTFILE) STREAM OUTPUT TITLE(FILE_NAME||'.BDR');
+PUT FILE(ADR_OUTFILE) EDIT(DATE3)(A); 
+
+DONE=FALSE;
+
+GET FILE(ADR_INFILE) LIST(CACA1,CACA2,CACA3);
+
+DO WHILE(^DONE);
+   IF (INST_INFO(CACA1)^=NULL) THEN DO;
+      INST_INFO_PTR=INST_INFO(CACA1);
+      TEMP_OF_INST_PTR=INST_INFO_PTR->TEMP_NODE;   
+      INSTRUCTION_POSITION=INST_INFO_PTR->TEMP_POS + TEMP_OF_INST_PTR->ABS_HIGH;
+      PUT FILE(ADR_OUTFILE) SKIP EDIT(CACA1,CACA2,CACA3,INSTRUCTION_POSITION)(F(6),F(6),F(6),F(6));
+   END;
+
+   ELSE DO;
+      PUT  SKIP EDIT('*** micro 2 instruction ',caca1,' not mentioned in constraint file')(a,f(6),a);
+   end;
+
+   GET FILE(ADR_INFILE) LIST(CACA1,CACA2,CACA3);
+
+END;
+
+PUT SKIP EDIT('CLOSING OUTPUT FILE '||FILE_NAME||'.BDR')(A);
+CLOSE FILE(ADR_OUTFILE);
+
+END OUTPUT_ADR_FILE;
+
+
+ALLOC_CLUSTER: PROCEDURE(CLUST_POINT,OLD_ALLOC) RETURNS(BIT(1));
+DECLARE (CLUST_POINT,TEMP_POINT,T_POINT) PTR;
+DECLARE (OLD_ALLOC,CURR_ALLOC) BIT(MAX_ADDR);
+DECLARE N FIXED BINARY(31);
+DECLARE FOO CHAR(5), I FIXED BIN(31);
+DECLARE BACKTRACK_COUNTER FIXED BINARY(31);
+
+CURR_ALLOC=OLD_ALLOC;
+CURR_TOTAL_ALLOC = OLD_TOTAL_ALLOC;
+
+IF BIT_HAT THEN PUT SKIP; 
+BACKTRACK_COUNTER=0;
+
+DO WHILE(^ALLOCATE_TEMPLATE_LIST(CLUST_POINT,N,CURR_ALLOC));
+   /* the allocation failed -- we will backtrack here and try again */
+
+   /* N templates were allocated, and # N+1 failed. Move up
+      # N if possible, else its predecessor, etc. If N
+      becomes zero, we have exhausted all posibilities, so DIE. */
+   /* don't do full 2**N tree search, try for more like linear in N */
+
+   IF BIT_A THEN PUT SKIP LIST('IN ALLOCATE CLUSTER');
+
+   IF N=0 THEN DO;
+      /* impossible to allocate even the first template */
+      CALL DUMP_STOP_INFO(OLD_ALLOC,CLUST_POINT);
+      RETURN(FALSE);     /* failure */
+   END;
+
+   /* restore the old allocation */
+   CURR_ALLOC=OLD_ALLOC;
+   CURR_TOTAL_ALLOC = OLD_TOTAL_ALLOC;
+   
+   /* Bump starting position of allocating the # N template by one,
+      unless it has already been bumped up. */
+
+   IF BACKTRACK_COUNTER>1 THEN
+	DO;
+	BACKTRACK_COUNTER = BACKTRACK_COUNTER-1;
+	N = BACKTRACK_COUNTER;
+	END;
+   ELSE
+	DO;
+	BACKTRACK_COUNTER=N;
+	END;
+   T_POINT = CLUST_POINT->TEMP_LIST;			/* at # 1 */
+   DO I=2 TO N; T_POINT = T_POINT->NEXT_TEMPLATE; END;	/* at # N */
+
+   T_POINT->BACKTRACK_BOUND = T_POINT->ABS_LOW + 1;	/* make #N start higher */
+   /* cripple T_POINT = T_POINT->NEXT_TEMPLATE;
+           T_POINT->BACKTRACK_BOUND = 0;	*/	/* allow #N+1 to start over */
+
+   /* open up the absolute range of high and low */
+   CALL OPEN_ABS(CLUST_POINT->TEMP_LIST);
+   CALL GIVE_CLUST_ABS_RANGE(CLUST_POINT,FALSE);	/* don't resolve blocks */
+   IF BIT_HAT THEN DO; PUT EDIT(' <Backtracking>')(A); PUT SKIP; END;
+   IF INDEX(DEBUG,'#')^=0 THEN CALL RLS_DUMP_ONE_CLUSTER(CLUST_POINT); 
+END;
+
+/* The allocation of the entire cluster worked. Commit it and never undo it */
+/* NOTE: if this strategy doesn't work, try sorting the clusters better first */
+IF BIT_HAT THEN PUT SKIP;
+OLD_ALLOC=CURR_ALLOC;
+OLD_TOTAL_ALLOC = CURR_TOTAL_ALLOC;
+RETURN(TRUE);    /* success */
+END ALLOC_CLUSTER;
+
+
+DUMP_OLD_ALLOC : PROCEDURE(OLD_ALLOC);
+DECLARE OLD_ALLOC BIT(MAX_ADDR);
+DECLARE (I,J,K) FIXED BINARY(31);
+DECLARE OUT_STRING CHARACTER(128);
+
+PUT SKIP;
+PUT  SKIP EDIT(' Dump of currently allocated positions')(a);
+DO J=0 TO MAX_ADDR BY 1024;
+    IF SUBSTR(OLD_ALLOC,J+1,1024)^='0'B THEN
+	DO I=0 TO 1023 BY 128;
+	   IF MOD(I,1024)=0 THEN PUT  SKIP EDIT(DIVIDE(J+I,1024,31),'K')(F(2),A(1));
+	       ELSE PUT  SKIP EDIT('   ')(A(3));
+	   OUT_STRING=TRANSLATE(CHAR(SUBSTR(OLD_ALLOC,J+I+1,128)),'.1','01');
+	   PUT  EDIT(OUT_STRING)(A);
+	END; /* I */
+END; /* J */
+
+END DUMP_OLD_ALLOC;
+
+
+DUMP_STOP_INFO: PROCEDURE(OLD_ALLOC,CLUST_POINT);
+/* Dumps all the relitive information about the cluster that can not be allocated */
+DECLARE OLD_ALLOC BIT(MAX_ADDR);
+DECLARE (next,CLUST_POINT) PTR;
+DECLARE I FIXED BINARY(31);
+
+PUT  SKIP EDIT('*** Cluster of instructions can not be allocated')(a);
+
+CALL DUMP_OLD_ALLOC(OLD_ALLOC);
+
+put  skip(3) edit(' dump of instructions in cluster:')(a);
+
+NEXT=CLUST_POINT->TEMP_LIST;
+DO WHILE(NEXT^=NULL);
+   PUT  SKIP(4) EDIT('Low: ',next->abs_low,' High: ', next->abs_high,
+	'Bound: ', next->backtrack_bound, ' Align: ', next->alignlist)
+	(a,f(7),a,f(7), a,f(7), a,b);
+   CALL PRINT_WHOLE_TEMP(NEXT);
+   NEXT=NEXT->NEXT_TEMPLATE;
+END;
+
+CALL RLS_DUMP_ONE_CLUSTER(CLUST_POINT);
+END DUMP_STOP_INFO;
+
+
+
+OPEN_ABS: PROCEDURE(TEMPLIST);
+
+DECLARE (TEMPLIST,NEXT) PTR;
+
+NEXT=TEMPLIST;
+
+DO WHILE(NEXT^=NULL);
+   NEXT->ABS_HIGH=MAX_ADDR;
+   NEXT->ABS_LOW=0;
+   NEXT=NEXT->NEXT_TEMPLATE;
+END;
+
+END OPEN_ABS;
+
+
+ALLOCATE_TEMPLATE_LIST: PROCEDURE(CLUST_POINT,ALLOC_COUNT,CURR_ALLOC) RETURNS(BIT(1));
+
+DECLARE (FIRST_TEMP,CLUST_POINT,TEMP_POINT) PTR;
+DECLARE CURR_ALLOC BIT(MAX_ADDR);
+DECLARE STATE BIT(1);
+DECLARE (ADR_LOW,ADR_HIGH) FIXED BINARY(31);
+DECLARE ALLOC_COUNT FIXED BIN(31);
+
+ALLOC_COUNT = 0;
+TEMP_POINT=CLUST_POINT->TEMP_LIST;
+FIRST_TEMP=TEMP_POINT;
+
+DO WHILE(TEMP_POINT^=NULL);
+   IF BIT_A THEN PUT SKIP LIST('IN ALLOCATE TEMPLATE LIST');
+
+   IF ^FIRST_FIT(TEMP_POINT,CURR_ALLOC) THEN DO;
+      /* failure to allocate template -- caller backtracks based on alloc_count */
+      IF BIT_Y THEN DO;
+         PUT  SKIP EDIT('fail on allocating temp: ', TEMP_POINT->TEMP_NUM)(A,F(7));
+      END;
+      RETURN(FALSE);     /******** FAILURE *******/
+   END;
+
+   CALL GIVE_CLUST_ABS_RANGE(CLUST_POINT,FALSE);	/* Don't commit blocks until all templ allocate */
+
+   ALLOC_COUNT = ALLOC_COUNT + 1;
+   TEMP_POINT=TEMP_POINT->NEXT_TEMPLATE;      /* point to next template in list after template just allocated */
+END;
+
+/* Only update the template block constraints after successful allocation of entire list */
+TEMP_POINT=CLUST_POINT->TEMP_LIST;
+DO WHILE(TEMP_POINT^=NULL);
+   CALL TEMP_BLOCK_TO_RANGE(TEMP_POINT);      /* Changes block to range constraints for template just allocated */   
+   TEMP_POINT=TEMP_POINT->NEXT_TEMPLATE;      /* point to next template in list after template just allocated */
+END;
+
+CALL GIVE_CLUST_ABS_RANGE(CLUST_POINT,TRUE);	/* Allow block to range constraint conversion here */
+
+RETURN(TRUE);    /******* SUCCESS ********/
+
+END ALLOCATE_TEMPLATE_LIST;
+
+
+FIRST_FIT: PROCEDURE(TEMP_POINT,CURR_ALLOC) RETURNS(BIT(1));
+
+DECLARE (TEMP_POINT,FIRST_TEMP,TEMP_POINT_LARGE,R) PTR;
+DECLARE (CURR_ALLOC,TEMPLATE1) BIT(MAX_ADDR);
+DECLARE (I,LOWEST,HIGHEST,LAST_INST) FIXED BINARY(31);
+DECLARE FOO CHAR(5);
+
+LOWEST = MAX(TEMP_POINT->ABS_LOW,TEMP_POINT->BACKTRACK_BOUND);
+HIGHEST=TEMP_POINT->ABS_HIGH;
+LAST_INST=TEMP_POINT->LAST_ONE + 1;
+TEMP_POINT_LARGE=TEMP_POINT->TEMPLATE;
+
+IF TEMP_POINT_LARGE=NULL
+   THEN SUBSTR(TEMPLATE1,1,LAST_INST)=TEMP_POINT->SMALL_STRING;
+   ELSE SUBSTR(TEMPLATE1,1,LAST_INST)=SUBSTR(TEMP_POINT_LARGE->TEMP_STR,1,LAST_INST);
+
+IF BIT_A THEN PUT SKIP LIST('IN FIRST FIT');
+
+IF SUBSTR(TEMPLATE1,1,1) THEN DO;
+   /* skip to first feasible location */
+   I = INDEX( SUBSTR(CURR_ALLOC,LOWEST+1,HIGHEST-LOWEST+1),'0'B);
+   IF I=0 THEN LOWEST = HIGHEST+1;
+          ELSE LOWEST = LOWEST + I-1;
+END;
+
+IF BIT_HAT THEN DO;
+	R = TEMP_POINT->INST_LIST;
+	IF R^=NULL THEN CALL DEC_HEX(R->INST,FOO); ELSE FOO = '    ';
+	PUT EDIT('  m', FOO) (A,A); 
+	CALL DEC_HEX(LOWEST,FOO); PUT EDIT('a', FOO) (A,A); END;
+
+DO I=LOWEST TO HIGHEST;
+
+      IF BIT_HAT & MOD(I,64)=0 THEN
+		DO; CALL DEC_HEX(I,FOO); PUT SKIP EDIT('   ',FOO)(A,A(4)); END;
+      /* Check that alignment is alright */
+      IF SUBSTR(TEMP_POINT->ALIGNLIST,MOD(I,MAX_ALIGN)+1,1) THEN DO;
+
+         /* check for conflicting entries */
+         IF (SUBSTR(TEMPLATE1,1,LAST_INST) & SUBSTR(CURR_ALLOC,I+1,LAST_INST))='0'B THEN DO;
+            /* combine the template with the current allocation */
+            IF BIT_HAT THEN PUT EDIT('X ') (A);
+            SUBSTR(CURR_ALLOC,I+1,LAST_INST)=(SUBSTR(TEMPLATE1,1,LAST_INST)  | SUBSTR(CURR_ALLOC,I+1,LAST_INST));
+	    CURR_TOTAL_ALLOC = CURR_TOTAL_ALLOC + TEMP_POINT->NUM_ONES;
+            TEMP_POINT->ABS_HIGH=I; /* Allocate template */
+            TEMP_POINT->ABS_LOW=I;
+            RETURN(TRUE);
+         END;
+	 ELSE DO;
+            IF BIT_HAT THEN PUT EDIT(',') (A);
+	 END;
+      END;
+      ELSE DO;
+            IF BIT_HAT THEN PUT EDIT('.') (A);
+      END;
+END; /* DO I */
+RETURN(FALSE);
+
+END FIRST_FIT;
+
+
+BLOCK_TO_RANGE: PROCEDURE(R_POINT);
+DECLARE (R_POINT,TEMP1,TEMP2) PTR;
+
+IF BIT_A THEN PUT SKIP LIST('IN BLOCK TO RANGE');
+
+TEMP1=R_POINT->TEMP1_ADR;
+CALL TEMP_BLOCK_TO_RANGE(TEMP1);
+
+TEMP2=R_POINT->TEMP2_ADR;
+CALL TEMP_BLOCK_TO_RANGE(TEMP2);
+
+END BLOCK_TO_RANGE;
+
+
+TEMP_BLOCK_TO_RANGE: PROCEDURE(TEMP_POINT);
+DECLARE (TEMP_POINT,INST_POINT) PTR;
+
+INST_POINT=TEMP_POINT->INST_LIST;
+
+DO WHILE(INST_POINT^=NULL);
+
+   IF BIT_A THEN PUT SKIP LIST('IN TEMPLATE BLOCK TO RANGE');
+
+   CALL INST_BLOCK_TO_RANGE(INST_POINT,TEMP_POINT);
+   
+   INST_POINT=INST_POINT->NEXT_INST;
+END;
+
+END TEMP_BLOCK_TO_RANGE;
+
+
+INST_BLOCK_TO_RANGE: PROCEDURE(INST_POINT,TEMP_POINT);
+DECLARE (INST_POINT,INSTNUM_INFO,TEMP_POINT) PTR;
+DECLARE (INSTNUM,HIGH_LOC,LOW_LOC,HIGH_BLOCK,LOW_BLOCK) FIXED BINARY(31);
+
+INSTNUM_INFO=INST_POINT;
+
+IF INSTNUM_INFO->BLOCK_LIST_PTR=NULL THEN RETURN;
+
+HIGH_LOC=TEMP_POINT->ABS_HIGH + INSTNUM_INFO->TEMP_POS + 1;
+LOW_LOC=TEMP_POINT->ABS_LOW + INSTNUM_INFO->TEMP_POS + 1;
+
+HIGH_BLOCK=HIGH_LOC - MOD(HIGH_LOC,BLOCK_SIZE);
+LOW_BLOCK=LOW_LOC - MOD(LOW_LOC,BLOCK_SIZE);
+
+IF HIGH_BLOCK^=LOW_BLOCK THEN RETURN;
+   ELSE CALL CHANGE_BLOCK_TO_RANGE(LOW_BLOCK,INSTNUM_INFO->BLOCK_LIST_PTR);
+
+END INST_BLOCK_TO_RANGE;
+
+
+
+CHANGE_BLOCK_TO_RANGE: PROCEDURE(MEM_BLOCK,BLOCK_CONST_LIST);
+DECLARE (BLOCK_CONST_LIST,BLOCKLIST) PTR;
+DECLARE (MEM_BLOCK) FIXED BINARY(31);
+
+LOW_EXT=MEM_BLOCK;
+HIGH_EXT=MEM_BLOCK+BLOCK_SIZE-2;
+
+BLOCKLIST=BLOCK_CONST_LIST->BLOCK_LIST;
+BLOCK_CONST_LIST->BLOCK_LIST=NULL;
+BLOCK_CONST_LIST=NULL;
+
+DO WHILE(BLOCKLIST^=NULL);
+      
+   IF BIT_X THEN DO;
+      PUT  SKIP EDIT('HIGH: ',HIGH_EXT,' LOW: ',LOW_EXT,' TO: ',BLOCKLIST->M2_INST_NUM)
+                                    (A,F(8),A,F(8),A,F(8));
+   END;
+   FROM=-1;
+   TO=BLOCKLIST->M2_INST_NUM;
+   LINENUM=BLOCKLIST->LINE_NUM;
+   CALL RANGE_TYPE;
+
+   BLOCKLIST=BLOCKLIST->NEXT_BLOCK;
+END;
+
+END CHANGE_BLOCK_TO_RANGE;
+
+
+ABS_RANGE_WORLD: PROCEDURE(CLUST_POINT);
+/* This procedure produces absolute ranges for all templates in the world */
+DECLARE (NEXT,CLUST_POINT) PTR;
+
+NEXT=CLUST_POINT;
+DO WHILE(NEXT^=NULL);
+   CALL GIVE_CLUST_ABS_RANGE(NEXT,TRUE);	/* commit block constraints */
+   NEXT=NEXT->NEXT_CLUSTER;
+END;
+IF BIT_Z THEN CALL DUMP_WORLD('00000100'B);
+END ABS_RANGE_WORLD;
+
+
+
+GIVE_CLUST_ABS_RANGE: PROCEDURE(CLUST_POINT,NEW_RANGE);
+/* This procedure produces absolute ranges for all the templates in the cluster pointed
+    to by CLUST_POINT.  */
+DECLARE (CLUST_POINT,R_POINT) PTR;
+DECLARE (CHANGE,STATUS) BIT(1);
+DECLARE I FIXED BINARY(31);
+DECLARE (T1,T2) PTR;
+DECLARE NEW_RANGE BIT(1) ALIGNED;
+
+I=0;
+
+STATUS='1'B;
+DO WHILE(STATUS);      
+   I=I+1;
+   R_POINT=CLUST_POINT->RANGE_LIST;
+   STATUS='0'B;
+
+
+   DO WHILE(R_POINT^=NULL);
+      IF ^ABS_RANGE(R_POINT,CHANGE) THEN DO;
+         /* range constraint pointed to by R_POINT makes constraints between two templates over contrained */
+         T1=R_POINT->TEMP1_ADR;
+         T2=R_POINT->TEMP2_ADR;
+         PUT  SKIP(2) EDIT('*** Relative range between two groups of instructions can not be satisfied')(a);
+         PUT  SKIP EDIT('Relative range is  the following.  It is ignored!!!!')(a);
+         PUT  SKIP EDIT('relative low: ',r_point->low,' relative high: ', r_point->high)(a,f(7),a,f(7));
+         PUT  SKIP EDIT ('low from LINE: ',r_point->low_line_num,' high from LINE: ', r_point->high_line_num)(a,f(7),a,f(7));
+         PUT  SKIP(4) EDIT('Absolute low: ',T1->abs_low,' Absolute high: ', T1->abs_high)(a,f(7),a,f(7));
+         CALL PRINT_WHOLE_TEMP(T1);
+         PUT  SKIP(4) EDIT('Absolute low: ',T2->abs_low,' Absolute high: ', T2->abs_high)(a,f(7),a,f(7));
+         CALL PRINT_WHOLE_TEMP(T2);
+CALL RLS_DUMP_ONE_CLUSTER(T1->CLUSTER);
+       
+         /* remove element from link list */
+         CALL REMOVE_LINK_LIST_ELEMENT(CLUST_POINT->RANGE_LIST,R_POINT);
+      END; 
+      STATUS=STATUS|CHANGE;
+
+      IF CHANGE THEN
+	 IF NEW_RANGE THEN CALL BLOCK_TO_RANGE(R_POINT);
+
+      R_POINT=R_POINT->NEXT_RANGE_NODE;
+   END;
+END;
+END GIVE_CLUST_ABS_RANGE;
+
+
+ABS_RANGE: PROCEDURE(R_POINT,CHANGE) RETURNS(BIT(1));
+DECLARE (R_POINT,TEMP1,TEMP2) PTR;
+DECLARE (STATUS,NEW_CHANGE,CHANGE) BIT(1);
+DECLARE (T1H,T1L,T2H,T2L,LDIFF,HDIFF) FIXED BINARY(31);
+
+TEMP1=R_POINT->TEMP1_ADR;
+TEMP2=R_POINT->TEMP2_ADR;
+
+LDIFF=TEMP2->ABS_LOW - TEMP1->ABS_LOW;
+HDIFF=TEMP2->ABS_HIGH - TEMP1->ABS_HIGH;
+
+T1H=TEMP1->ABS_HIGH;
+T1L=TEMP1->ABS_LOW;
+
+T2H=TEMP2->ABS_HIGH;
+T2L=TEMP2->ABS_LOW;
+
+NEW_CHANGE='0'B;
+
+IF HDIFF > R_POINT->HIGH THEN DO;
+   T2H=R_POINT->HIGH + TEMP1->ABS_HIGH;
+   NEW_CHANGE='1'B;
+END;
+ELSE IF HDIFF < R_POINT->LOW THEN DO;
+        T1H=TEMP2->ABS_HIGH - R_POINT->LOW;
+        NEW_CHANGE='1'B;
+     END;
+
+IF LDIFF < R_POINT->LOW THEN DO;
+   T2L=TEMP1->ABS_LOW + R_POINT->LOW;
+   NEW_CHANGE='1'B;
+END;
+
+ELSE IF LDIFF > R_POINT->HIGH THEN DO;
+        T1L=TEMP2->ABS_LOW - R_POINT->HIGH;
+        NEW_CHANGE='1'B;
+     END;
+
+IF (T1L > T1H) | (T2L > T2H) THEN RETURN(FALSE);  /* temp1 and temp2 over constrained */
+
+TEMP1->ABS_HIGH=T1H;
+TEMP1->ABS_LOW=T1L;
+
+TEMP2->ABS_HIGH=T2H;
+TEMP2->ABS_LOW=T2L;
+CHANGE=NEW_CHANGE;
+
+RETURN(TRUE);  /* everything ok */
+
+END ABS_RANGE;
+
+
+ALIGN_VALUE_WORLD: PROCEDURE;
+/* Gives all templates align values */
+DECLARE (LINK,NEWLINK) PTR;
+
+LINK=HEAD_CLUSTER;
+
+DO WHILE(LINK^=NULL);
+   CALL TEMP_VAL_LIST(LINK->TEMP_LIST);
+   LINK=LINK->NEXT_CLUSTER;
+END;
+
+END ALIGN_VALUE_WORLD;
+
+TEMP_VAL_LIST: PROCEDURE(LINK);
+/* this procedure gives all templates in link list pointed to
+    by LINK an align value */
+
+DECLARE (LINK,NEXT,NEWLINK) PTR;
+
+NEXT=LINK;
+DO WHILE(NEXT^=NULL);
+   NEXT->ALIGN_VAL=TEMP_VAL_ONE(NEXT);
+   NEXT=NEXT->NEXT_TEMPLATE;
+END;
+
+END TEMP_VAL_LIST;
+
+
+TEMP_VAL_ONE: PROCEDURE(TEMP_PTR) RETURNS(FIXED BINARY);
+/* This procedure calculates the weighting value for template TEMPL and
+    stores this value in the template block */
+DECLARE TEMP_PTR  PTR;
+DECLARE (WEIGHT,NUM_INST) FIXED BINARY;
+
+WEIGHT=COUNT_ONES(TEMP_PTR->ALIGNLIST); 
+
+RETURN(WEIGHT);
+END TEMP_VAL_ONE;
+
+COUNT_ONES: PROCEDURE(BITSTRING) RETURNS(FIXED BINARY(31));
+/* this procedure counts the number of ones in the align template "bitstring"  */
+DECLARE BITSTRING BIT(MAX_ALIGN);
+DECLARE (NUM_INST,I) FIXED BINARY;
+
+NUM_INST=0;
+
+DO I=1 TO MAX_ALIGN;
+   IF SUBSTR(BITSTRING,I,1)='1'B THEN NUM_INST=NUM_INST+1;
+END;
+RETURN(NUM_INST);
+END COUNT_ONES;
+
+TOTAL_VALUE_ALL: PROCEDURE(START_POINT);
+/* gives the world is hardness to allocate value */
+DECLARE START_POINT PTR;
+DECLARE I FIXED BINARY(31);
+
+   IF OLD_TOTAL_ALLOC > (ALLOCATED_AT_LAST_RECOUNT + RECOUNT) THEN
+      /* RECOUNT HOW MANY UNUSED WORDS TO LEFT OF EACH LOCATION (0 unchanged, =0) */
+      DO;
+      IF BIT_HAT THEN PUT SKIP LIST('RECOUNTING... ');
+      ALLOCATED_AT_LAST_RECOUNT = OLD_TOTAL_ALLOC;
+      DO I=1 TO MAX_ADDR-1;
+	IF SUBSTR(OLD_ALLOC,I+1,1) THEN
+	    WORDS_LEFT(I) = WORDS_LEFT(I-1);
+	ELSE
+	    WORDS_LEFT(I) = WORDS_LEFT(I-1) + 1;
+      END;
+      END;
+   CALL TOTAL_TEMP_VAL(START_POINT);
+   CALL TOTAL_CLUST_VAL(START_POINT);
+
+END TOTAL_VALUE_ALL;
+
+
+TOTAL_TEMP_VAL: PROCEDURE(START_POINT);
+/* Gives all templates value of hardness to allocate */
+DECLARE (LINK,START_POINT,NEWLINK) PTR;
+
+LINK=START_POINT;
+
+DO WHILE(LINK^=NULL);
+   CALL TOTAL_TEMP_LIST_VAL(LINK->TEMP_LIST);
+   LINK=LINK->NEXT_CLUSTER;
+END;
+
+END TOTAL_TEMP_VAL;
+
+TOTAL_TEMP_LIST_VAL: PROCEDURE(LINK);
+/* this procedure gives all templates in link list pointed to
+    by LINK a hardness to allocate value  */
+
+DECLARE (LINK,NEXT,NEWLINK) PTR;
+
+IF INDEX(DEBUG,'(')^=0 THEN PUT SKIP;
+NEXT=LINK;
+DO WHILE(NEXT^=NULL);
+   NEXT->TEMP_VAL=TOTAL_TEMP_VAL_ONE(NEXT);
+   IF INDEX(DEBUG,'(')^=0 THEN PUT EDIT(NEXT->TEMP_VAL)(F(8));
+   NEXT=NEXT->NEXT_TEMPLATE;
+END;
+
+END  TOTAL_TEMP_LIST_VAL;
+
+
+TOTAL_TEMP_VAL_ONE: PROCEDURE(TEMP_PTR) RETURNS(FIXED BINARY);
+/* This procedure calculates the weighting value for template TEMPL and
+    stores this value in the template block */
+DECLARE TEMP_PTR  PTR;
+DECLARE (WEIGHT,NUM_INST) FIXED BINARY;
+
+WEIGHT=TEMP_PTR->ALIGN_VAL;
+
+/* RLS count ones in old_alloc via WORDS_LEFT */
+WEIGHT=(WORDS_LEFT(TEMP_PTR->ABS_HIGH) - WORDS_LEFT(TEMP_PTR->ABS_LOW)) * WEIGHT; /* * TEMP_PTR->ALIGN_VAL;*/
+IF TEMP_PTR->NUM_ONES=1 THEN WEIGHT = WEIGHT+WEIGHT;	 /* Do singletons last */
+
+RETURN(WEIGHT);
+END TOTAL_TEMP_VAL_ONE;
+
+TOTAL_CLUST_VAL: PROCEDURE(START_POINT);
+/* this routine give a hardness to allocate value to each cluster */
+DECLARE START_POINT PTR;
+DECLARE (LINK1,NEW_HEAD) PTR;
+DECLARE VALUE FIXED BINARY;
+
+/* give clusters in link list a weighting value */
+LINK1=START_POINT;
+
+DO WHILE(LINK1^=NULL);
+   LINK1->CLUST_VAL= CLUST_TOTAL_VAL_ONE(LINK1);
+   LINK1=LINK1->NEXT_CLUSTER;
+END;
+
+END TOTAL_CLUST_VAL;
+
+
+CLUST_TOTAL_VAL_ONE: PROCEDURE(LINK1) RETURNS(FIXED BINARY(31));
+/* this routine gives a hardness to allocate value for an individual cluster */
+/* Use MIN of any contained template -- Low value = important to allocate/heavily constrained */
+DECLARE (LINK1,LINK2) PTR;
+DECLARE (X,VALUE) FIXED BINARY;
+
+VALUE=99999999;
+LINK2=LINK1->TEMP_LIST;
+
+DO WHILE(LINK2^=NULL);
+   VALUE=MIN(VALUE,LINK2->TEMP_VAL);
+   LINK2=LINK2->NEXT_TEMPLATE;
+END;
+
+RETURN(VALUE);
+
+END CLUST_TOTAL_VAL_ONE;
+
+
+SORT_WORLD: PROCEDURE(START_POINT);
+/* This procedure sorts all templates in clusters and the clusters themselfs as to how 
+   hard they are to allocate */
+DECLARE (NEXT,HEAD_SORT,START_POINT) PTR;
+
+NEXT=START_POINT;
+
+IF BIT_A THEN PUT SKIP LIST('IN SORT WORLD');
+
+DO WHILE(NEXT^=NULL);
+   CALL SORT_LIST(NEXT->TEMP_LIST,HEAD_SORT);
+   NEXT->TEMP_LIST=HEAD_SORT;
+
+   NEXT=NEXT->NEXT_CLUSTER;
+END;
+
+CALL SORT_LIST(START_POINT,HEAD_SORT);
+START_POINT=HEAD_SORT;
+
+END SORT_WORLD;
+
+
+SORT_LIST: PROCEDURE(HEAD_UNSORT,HEAD_SORT);
+
+DECLARE 1 BLOCK BASED(NEW_BLOCK),
+          2 LINK PTR,
+	  2 PRIOR_LINK PTR,
+          2 LINK2 PTR,
+          2 WEIGHT1 FIXED BINARY(31),
+          2 WEIGHT2 FIXED BINARY(31);
+
+DECLARE (NEW_BLOCK,HEAD_UNSORT,HEAD_SORT,INSERT,NEXT,POINT) PTR;
+
+/* insert dummy element in front of sorted list which will have
+    the smallest value */
+ALLOCATE BLOCK SET(NEW_BLOCK);
+   NEW_BLOCK->WEIGHT1=-1;
+   NEW_BLOCK->WEIGHT2=-1;
+   NEW_BLOCK->LINK=NULL;
+   NEW_BLOCK->PRIOR_LINK=NULL;
+   HEAD_SORT=NEW_BLOCK;
+
+DO WHILE(HEAD_UNSORT^=NULL);
+   /* remove first element from unsorted list */
+   POINT=HEAD_UNSORT;
+   HEAD_UNSORT=POINT->LINK;
+
+   /* find element in sorted list that element from unsorted
+      list should go after */
+   INSERT=HEAD_SORT;
+   NEXT=HEAD_SORT;
+   DO WHILE(NEXT^=NULL);
+      IF (POINT->WEIGHT1 = NEXT->WEIGHT1) THEN
+         IF (POINT->WEIGHT2 >= NEXT->WEIGHT2) THEN INSERT=NEXT;
+         ELSE;
+      ELSE INSERT=NEXT;
+
+      NEXT=NEXT->LINK;
+      IF NEXT^=NULL THEN
+              IF POINT->WEIGHT1 < NEXT->WEIGHT1 THEN NEXT=NULL;
+   END;
+
+   /* insert element in sorted list */
+   POINT->LINK=INSERT->LINK;
+   INSERT->LINK=POINT;
+   IF POINT->LINK^=NULL THEN
+     POINT->LINK->PRIOR_LINK=POINT;
+   POINT->PRIOR_LINK=INSERT;
+END;
+
+/* Remove dummy element from head of sorted list */
+HEAD_SORT=HEAD_SORT->LINK;
+
+END SORT_LIST;
+
+PRINT_WHOLE_TEMP: PROCEDURE(TEMP_POINT);
+/* dumps the template pointed to by TEMP_POINT */
+DECLARE TEMP_POINT PTR;
+DECLARE I FIXED BINARY(31);
+
+DO I=0 TO TEMP_POINT->LAST_ONE BY 128;
+   CALL PRINT_TEMPLATE(TEMP_POINT,I);
+END;
+
+END PRINT_WHOLE_TEMP;
+
+
+PRINT_TEMPLATE: PROCEDURE(TEMP_POINT,LOW);
+/* prints 128 elements of at template starting at low */
+DECLARE (TEMP_POINT,POINT,NEXT,INSTBLOCK) PTR;
+DECLARE (PAD,HIGH,LOW,I,J,K,POS,INSTNUM,P_LOW,P_HIGH) FIXED BINARY(31);
+DECLARE TEMPSTR BIT(MAX_ADDR);
+DECLARE OUT_BLOCK(0:4) CHARACTER(128);
+DECLARE DIGIT FIXED BINARY(5);
+DECLARE PERIOD CHARACTER(128);
+DECLARE HEX_CHAR CHARACTER(5);
+
+IF TEMP_POINT->TEMPLATE=NULL THEN TEMPSTR=TEMP_POINT->SMALL_STRING;
+ELSE DO;
+   POINT=TEMP_POINT->TEMPLATE;
+   TEMPSTR=POINT->TEMP_STR;
+END;
+
+PAD=0;
+
+IF LOW<0 THEN PAD=0-LOW;
+HIGH=LOW+127;
+
+PERIOD='........................................................................................................................';
+PUT  SKIP(2) EDIT(SUBSTR(PERIOD,1,PAD))(A);
+PUT  EDIT(TRANSLATE(CHAR(SUBSTR(TEMPSTR,MAX(LOW+1,1),128-PAD)),'.X','01'))(A);
+
+OUT_BLOCK(0)=' ';
+OUT_BLOCK(1)=' ';
+OUT_BLOCK(2)=' ';
+OUT_BLOCK(3)=' ';
+OUT_BLOCK(4)=' ';  
+
+NEXT=TEMP_POINT->INST_LIST;
+
+DO WHILE(NEXT^=NULL);
+   INSTBLOCK=NEXT;
+
+   IF (LOW<=INSTBLOCK->TEMP_POS) & (HIGH >= INSTBLOCK->TEMP_POS) THEN DO;
+         CALL DEC_HEX(INSTBLOCK->INST,HEX_CHAR);
+         DO J=1 TO 5; 
+            SUBSTR(OUT_BLOCK(J-1),INSTBLOCK->TEMP_POS-LOW+1,1)=SUBSTR(HEX_CHAR,J,1);
+         END;
+      END;        
+  
+ NEXT=NEXT->NEXT_INST;
+ END;
+
+K=0;
+DO K=0 TO 4;
+   IF OUT_BLOCK(K)^=' ' THEN PUT  SKIP EDIT(OUT_BLOCK(K))(A);
+END;
+
+END PRINT_TEMPLATE;
+
+DEC_HEX: PROCEDURE(INSTNUM,HEX_CHAR);
+/* this procedure converts INSTNUM to a hex character string "HEX_CHAR" */
+DECLARE (I,POINT,DIGIT,NUM,INSTNUM) FIXED BINARY(31);
+DECLARE (HEX_CHAR,TEMP_STR) CHARACTER(5);
+
+TEMP_STR=' ';
+HEX_CHAR=' ';
+
+NUM=INSTNUM;
+
+DO I=4 TO 1 BY -1;
+   DIGIT=MOD(NUM,16);
+   NUM=DIVIDE(NUM-DIGIT,16,31);
+   SUBSTR(TEMP_STR,I,1)=SUBSTR('0123456789ABCDEF',DIGIT+1,1);
+END;
+
+HEX_CHAR=TEMP_STR;
+
+END DEC_HEX;
+
+
+
+DUMP_WORLD: PROCEDURE(OPT_STRING);
+/* Dumps relitive information about all the clusters according to
+  the OPT_STRING */
+DECLARE NEXT PTR;
+DECLARE OPT_STRING BIT(LEN_OPT_STRING);
+PUT  SKIP EDIT('***DUMP START***')(A);
+NEXT=HEAD_CLUSTER;
+DO WHILE(NEXT^=NULL);
+   CALL DUMP_CLUSTER(NEXT,OPT_STRING);
+   NEXT=NEXT->NEXT_CLUSTER;
+END;
+PUT  SKIP EDIT('***DUMP END ***')(A);
+
+END DUMP_WORLD;
+
+
+DUMP_CLUSTER: PROCEDURE(CLUST_ADDR,OPT_STRING);
+/* Dumps the relitive information about one cluster according to the 
+   OPT_STRING */
+DECLARE (POINT1,POINT2,CLUST_ADDR,NEXT) PTR;
+DECLARE OPT_STRING BIT(LEN_OPT_STRING);
+DECLARE I FIXED BINARY(31);
+
+PUT  SKIP EDIT('***CLUSTER START***')(A);
+NEXT=CLUST_ADDR->TEMP_LIST;
+DO WHILE(NEXT^=NULL);
+   CALL DUMP_TEMPLATE(NEXT,OPT_STRING);
+   NEXT=NEXT->NEXT_TEMPLATE;
+END;
+
+IF SUBSTR(OPT_STRING,1,1)='1'B THEN DO;
+
+   /* print out range constraints between templates in the cluster */
+   PUT  SKIP EDIT('RANGE CONSTRAINT: ')(A);
+   NEXT=CLUST_ADDR->RANGE_LIST;
+   I=0;
+
+   DO WHILE(NEXT^=NULL);
+      IF I=3 THEN DO;
+          PUT  SKIP EDIT('RANGE CONSTRAINT: ')(A);
+          I=0;
+      END;
+      I=I+1;
+      POINT1=NEXT->TEMP1_ADR;
+      POINT2=NEXT->TEMP2_ADR;
+      PUT  EDIT(POINT1->TEMP_NUM,POINT2->TEMP_NUM,NEXT->LOW,NEXT->HIGH ,' **** ')(F(7),F(7),F(7),F(7),A);
+      NEXT=NEXT->NEXT_RANGE_NODE;
+   END;
+END;
+PUT  SKIP EDIT('***CLUSTER END***')(A);
+
+END DUMP_CLUSTER;
+
+
+DUMP_TEMPLATE: PROCEDURE(TEMP_ADDR,OPT_STRING);
+/* dumps the relitive information about one template according to the 
+   OPT_STRING */
+DECLARE (NEXT,TEMP_ADDR,LARGE_PTR) PTR;
+DECLARE OPT_STRING BIT(LEN_OPT_STRING);
+DECLARE I FIXED BINARY(31);
+
+PUT  SKIP EDIT('***DUMP TEMPLATE ',TEMP_ADDR->TEMP_NUM,'***')(A,F(7),A);
+
+/* print out misc info */
+IF (SUBSTR(OPT_STRING,3,1)) THEN PUT  SKIP EDIT('  LAST ONE: ',TEMP_ADDR->LAST_ONE,
+                                                             '  TEMP VAL: ',TEMP_ADDR->TEMP_VAL,
+                                                             '  NUM ONES: ',TEMP_ADDR->NUM_ONES)
+                                                            (A,F(14),A,F(14),A,F(14));
+
+/* print alignment string */
+IF (SUBSTR(OPT_STRING,2,1)) THEN  PUT  SKIP EDIT('ALIGNMENT STRING: ',TEMP_ADDR->ALIGNLIST)
+                                                             (A,B);
+IF (SUBSTR(OPT_STRING,6,1)) THEN PUT  SKIP EDIT
+     ('ABS HIGH: ',TEMP_ADDR->ABS_HIGH,' ABS LOW: ',TEMP_ADDR->ABS_LOW)(A,F(8),A,F(8));
+
+/* print out template */
+IF (SUBSTR(OPT_STRING,4,1)) THEN DO;
+   PUT  SKIP EDIT('TEMPLATE:  ')(A);
+   LARGE_PTR=TEMP_ADDR->TEMPLATE;
+   I=0;
+
+   DO WHILE(I<=TEMP_ADDR->LAST_ONE);
+      IF LARGE_PTR=NULL THEN DO;
+         PUT  EDIT(SUBSTR(TEMP_ADDR->SMALL_STRING,I+1,64))(B);
+         PUT  SKIP EDIT('          ')(A);
+      END;
+      ELSE DO;
+         PUT  EDIT(SUBSTR(LARGE_PTR->TEMP_STR,I+1,64))(B);
+         PUT  SKIP EDIT('          ')(A);
+      END;
+   I=I+64;
+   END;
+END;
+   
+/* print out link list of instructions in the template */
+IF SUBSTR(OPT_STRING,5,1) THEN DO;
+   PUT  SKIP EDIT('INSTUCTION LIST: ')(A);
+   NEXT=TEMP_ADDR->INST_LIST;
+   I=0;
+   DO WHILE(NEXT^=NULL);
+      PUT  EDIT(NEXT->INST)(F(7));
+      I=I+1;
+      IF I=12 THEN DO;
+         PUT  SKIP;
+         I=0;
+      END;
+
+      NEXT=NEXT->NEXT_INST;
+   END;
+END;
+
+END DUMP_TEMPLATE;
+
+
+DUMP_INSTR_ALL: PROCEDURE(OPT_LIST);
+/* this procedure dumps info from the instruction information nodes dependent on OPT_LIST*/
+DECLARE OPT_LIST BIT(OPT_LIST_LEN);
+DECLARE I FIXED BINARY(31);
+
+PUT  SKIP(2) EDIT('***DUMP INSTRUCTIONS***')(A);
+DO I=-1 TO MAX_ADDR;
+   IF INST_INFO(I)^=NULL THEN DO;
+      CALL DUMP_INSTR_ONE(I,OPT_LIST);
+   END;
+END;
+
+PUT  SKIP EDIT('***INSTRUCTIONS DUMP END***')(A);
+END DUMP_INSTR_ALL;
+
+
+DUMP_INSTR_ONE: PROCEDURE(M2_NUM,OPT_LIST);
+/* dumps info from one instruction information node dependent on OPT_LIST */
+DECLARE OPT_LIST BIT(OPT_LIST_LEN);
+DECLARE (POINT_INST_INFO,NEXT,POINT_TEMPLATE) PTR;
+DECLARE M2_NUM FIXED BINARY(31);
+
+POINT_INST_INFO=INST_INFO(M2_NUM);
+POINT_TEMPLATE=POINT_INST_INFO->TEMP_NODE;
+
+IF SUBSTR(OPT_LIST,1,1) THEN DO;
+   PUT  SKIP(2) EDIT('INSTRUCTION: ',M2_NUM,'  TEMPLATE: ',POINT_TEMPLATE->TEMP_NUM,
+                               '  TEMPLATE POSITION: ',POINT_INST_INFO->TEMP_POS)(A,F(7),A,F(7),A,F(7));
+END;
+
+END DUMP_INSTR_ONE;
+
+
+RLS_COUNT : PROCEDURE(P) RETURNS(FIXED BINARY(31));
+/* counts number of nodes in a list linked thru its first longword */
+DECLARE P PTR;
+DECLARE Q PTR, I FIXED BIN(31);
+
+Q = P;  I = 0;
+DO WHILE( Q^=NULL );
+	I = I+1;
+	Q = Q->NEXT_BLOCK;
+END;
+RETURN(I);
+END RLS_COUNT;
+
+RLS_DUMP_ONE_CLUSTER : PROCEDURE(Q);
+	DECLARE Q PTR;
+	    DO;					/* non-trivial cluster */
+		PUT SKIP EDIT( 'CLUSTER  ',Q->CLUST_NUM, ' val=',Q->CLUST_VAL,
+			' templates=', RLS_COUNT(Q->TEMP_LIST),
+			' ranges=', RLS_COUNT(Q->RANGE_LIST) ) 
+			(A,F(7),A,F(7),A,F(7),A,F(7));
+		CALL RLS_DUMP_TEMPL(Q->TEMP_LIST);
+		CALL RLS_DUMP_RANGE(Q->RANGE_LIST);
+	    END;
+END RLS_DUMP_ONE_CLUSTER;
+
+RLS_DUMP_CLUSTERS : PROCEDURE(P);
+DECLARE P PTR;
+DECLARE Q PTR, I FIXED BIN(31);
+
+PUT SKIP;
+PUT SKIP EDIT( 'NUMBER OF CLUSTERS = ', RLS_COUNT(P)) (A,F(7));
+
+Q = P;
+DO WHILE( Q^=NULL );
+	IF INDEX(DEBUG,'*')^=0 | Q->CLUST_VAL<250000 THEN
+		CALL RLS_DUMP_ONE_CLUSTER(Q);
+	Q = Q->NEXT_CLUSTER;
+END;
+END RLS_DUMP_CLUSTERS;
+
+
+RLS_DUMP_TEMPL : PROCEDURE(P);
+DECLARE P PTR;
+DECLARE (Q,R) PTR, (I,J) FIXED BIN(31);
+DECLARE OUT_STR CHAR(40);
+DECLARE (FIRST_INST_STR,C1,C2,C3,C4,C5) CHAR(5);
+
+Q = P;
+DO WHILE( Q^=NULL );
+	OUT_STR = '........................................';
+	R = Q->INST_LIST;
+	IF R^=NULL THEN CALL DEC_HEX(R->INST,FIRST_INST_STR); ELSE FIRST_INST_STR = '    ';
+	DO WHILE (R^=NULL);
+		IF 0<=R->TEMP_POS & R->TEMP_POS<=39 THEN
+			SUBSTR(OUT_STR,R->TEMP_POS+1,1) = 'x';
+		R = R->NEXT_INST;
+	END;
+	CALL DEC_HEX(Q->ABS_LOW,C1);
+	CALL DEC_HEX(Q->ABS_HIGH,C2);
+	CALL DEC_HEX(Q->BACKTRACK_BOUND,C3);
+	CALL DEC_HEX(WORDS_LEFT(Q->ABS_LOW),C4);
+	CALL DEC_HEX(WORDS_LEFT(Q->ABS_HIGH),C5);
+	PUT SKIP EDIT( '    TEMPL',Q->TEMP_NUM, ' val=',Q->TEMP_VAL,
+		' #I', Q->NUM_ONES, ' al=',Q->ALIGN_VAL, ' back= a',C3,
+		' a', C1, '..a', C2,
+		' ', C4, '-', C5,
+		' m', FIRST_INST_STR, ': ')
+		(A,F(7),A,F(7),  A,F(5),A,F(5),A,A(4),  A,A(4),A,A(4),  A,A(4),A,A(4),  A,A(4),A);
+	IF Q->NUM_ONES>1 THEN PUT EDIT(OUT_STR)(A);	/* supress trivial */
+
+	IF INDEX(DEBUG,'%')^=0 THEN CALL PRINT_WHOLE_TEMP(Q);
+	Q = Q->NEXT_TEMPLATE;
+END;
+END RLS_DUMP_TEMPL;
+
+
+RLS_DUMP_RANGE : PROCEDURE(P);
+DECLARE P PTR;
+DECLARE Q PTR, (I,J) FIXED BIN(31);
+DECLARE (C1,C2) CHAR(5);
+
+Q = P;
+DO WHILE( Q^=NULL );
+	IF Q->TEMP1_ADR^=NULL THEN I = Q->TEMP1_ADR->TEMP_NUM; ELSE I = 7777;
+	IF Q->TEMP2_ADR^=NULL THEN J = Q->TEMP2_ADR->TEMP_NUM; ELSE J = 7777;
+	CALL DEC_HEX(Q->LOW,C1);
+	CALL DEC_HEX(Q->HIGH,C2);
+	PUT SKIP EDIT( '    RANGE a', C1, '-a', C2,
+		' templs ', I,J,
+		' LINEs ', Q->LOW_LINE_NUM, Q->HIGH_LINE_NUM)
+		(A,A(4),A,A(4), A,F(7),F(7), A,F(7),F(7) );
+	Q = Q->NEXT_RANGE_NODE;
+END;
+END RLS_DUMP_RANGE;
+
+
+END ALLOC2;

@@ -1,0 +1,2605 @@
+ralloc1 : proc options(main);
+
+%REPLACE compile_date BY '27-Mar-86';
+
+/*
+	first pass of RIGEL address allocator.
+	richard l sites 28-Nov-84
+
+REVISION HISTORY
+
+27-Mar-86  GMU  Output delta constraint of 2049 (CALL_DELTA+1) for uCALL.
+18-Feb-86  CBS  Use wider fields when writing .CON file
+11-May-85  GMU	Convert from latest version of CVAX allocator
+28-Nov-84  RLS  Cloned from Scorpio ALLOC1
+
+	The purpose of the address allocator is to map the arbitrary 
+	microcode addresses assigned by Micro-2 into final Scorpio 
+	hardware addresses. The main problem to be solved is to satisfy 
+	the relative branch constraints of the Scorpio hardware, which 
+	allows conditional branches of only (-63..+64) from the current 
+	instruction. Micro-2 doesn't understand this concept at all, so 
+	we wrote a post-pass.
+
+	The incoming addresses are completely arbitrary. The constraints 
+	are embedded as stylized comments or implied from the actual 
+	microinstruction (in hex). Stylized comments begin with ";=".
+
+	This program, ALLOC1, reads in the xxx.MCR file that is created 
+	by Micro-2, and writes files of extracted constraints. The 
+	xxx.ULD file is not used by ALLOC1; it is used by ALLOC3.
+
+MICRO-2 LISTING SYNTAX:
+
+	listing ::= (page <FF>)* page
+	page	::= [trashline] header1 header2 blankline (pagetext)*
+	pagetext   ::= blankline | binline | nobinline
+	binline	   ::= microcode <SEMI> lineno <TAB> text
+	nobinline  ::= <SEMI> lineno <TAB> text
+	microcode  ::= blank | microinst
+	microinst  ::= memoryletter <BLANK> address <COMMA> <BLANK> bits
+	address	::= hex [hex] [hex] [hex]
+	bits	::= (hex hex hex hex ,)* [hex] [hex] [hex] [hex]
+
+	Notes: (1) Micro-2 current screws up on embedded form feeds, so 
+		sometimes it doesn't print the heading lines until the
+		SECOND line of a new page.
+	       (2) Header1 contains:
+			col 1		";"
+			col 2..29	first filename
+			col 30..47	"MICRO2" title
+			col 48..56	date of assembly
+			col 59..66	time of assembly
+			col 124..127	"Page"
+			col 128..132	page number
+	       (3) Header2 contains:
+			col 1		";"
+			col 2..29	current filename
+			col 30..end	current heading
+	       (4) Line numbers are LEFT justified with no leading blank
+	       (5) Line numbers are followed by <TAB>, even if the rest 
+		of the line is blank.
+	       (6) Microcode is followed by a <TAB>, so <SEMI> before 
+		line number is always in col 8n+1.
+
+STYLIZED COMMENT SYNTAX:
+
+	Anywhere in the "text" area defined above, stylized comments
+	may exist. They start with ";=" and end with either <EOL> or 
+	";". This defintion allows multiple stylized comments on a line,
+	with the ";" that begins the second one also ending the first 
+	one. It also allows non-stylized comments both before and after 
+	a stylized one.
+
+	The currently-recognized stylized comments are:
+
+	;= BEGIN name
+
+	;= END name
+
+	;= AT label-expr
+
+	;= ALIGNLIST align-expr "(" label-list ")"
+
+
+	where	label-expr  ::= label [+/- hexconst] | hexconst
+		label-exprN ::= label | hexconst | null
+		label-list  ::= ( label-exprN <COMMA> )* label-exprN
+		align-expr  ::= ( "*" | "0" | "1" )*
+
+	Notes: (1) Both upper and lower case are allowed.
+	       (2) All names an labels are maximum 31 characters, and may 
+		include embedded "._%$" characters.
+	       (3) The names in begin/end are arbitrary, and need not be
+		labels in the program. They must be properly matched and 
+		nested.
+	       (4) Begin/end are used to delimit chunks of code.
+	       (5) AT specifies an absolute or fixed relative address 
+		assignment. It applies to the first following alignlist 
+		or microinstruction. 
+	       (6) ALIGNLIST specifies an alignment for the first 
+		instruction in a list, the spacing of the instructions, 
+		and the list of instruction labels involved. The 
+		alignment expression is identical to Micro-2's -- a 
+		sequence of *01 characters. "*" is an address bit that 
+		can be anything, while "0" and "1" force address bits to 
+		zero and one respectively. An alignment expressing is 
+		logically filled with leading "*"'s. Any address fitting 
+		the bit pattern described can be assigned to the first 
+		label in the label-list. Subsequent labels are assigned 
+		to increasing addresses, counting up in the "0" bit 
+		positons only. [Yes, this is weird if it is the first 
+		time you've seen it.] Thus, 
+			ALIGNLIST 0*10 (A,B,C,D)
+		means any address ending in "0010" or "0110" is
+		acceptable for A, and that the four labels will be 
+		assigned addresses A+0, A+1, A+8, and A+9. Labels may be 
+		left out (and the corresponding address available for 
+		other uses) by writing consecutative commas.
+	       (7)
+	       (8)
+	       (9) The lists in ALIGNLIST must be contained 
+		on consecutative Micro-2 lines. This is just an error 
+		check to guard against a missing ")" causing all 
+		subsequent stylized comments from being swallowed up.
+	       (10) Any stylized comment may be spread across many 
+		consecutive lines by starting anew with ";=". Example:
+
+		...Micro-2 text		;= GLOBAL (A, B,C,D, ; true comment
+		...Micro-2 again	;=     E,F,G)	     ;  trash
+
+OUTPUT FILE SYNTAX
+
+	There are three output files, named
+		xxx.CON
+		xxx.ADR
+		xxx.EXT
+
+	The first is a file of address constraints. These consist of a
+	type-letter followed by a list of numbers, all as a regular
+	ASCII file. The second is a list of <incoming address, line 
+	number, page number> triples. ALLOC2 will add a fourth column of 
+	final absolute addresses. The third file is a list of <incoming 
+	address, label> pairs for externals and globals only.
+
+	Each file starts with a line containing ";", date, and time.
+
+
+	The constraint-types are: 
+
+	D lineno from to  delta 
+	B lineno from to  n 
+	A lineno from off align
+
+	D = DELTA constraint.
+		lineno	= input line number
+		from	= input fake address | -1	[-1=abs_zero]
+		to	= input fake address
+		delta	= decimal integer
+	    In the final address assignment, the instruction "to" must 
+		be at address "from"+delta.
+		The arbitrary incoming Micro-2-assigned 
+		addresses are used to designate "from" and "to". The 
+		line number is the line number of the source line 
+		containing the CONSTRAINT, and is only used for error 
+		messages. The dummy input address -1 is used to signify 
+		the absolute final address 0. All other input addresses 
+		are non-negative and form a relatively compact set (i.e. 
+		0..2K). Examples:
+			D 2259 12 58 1		12 falls thru to 58
+			D 2260 -1 14 123	14 is at address 123
+
+	B = BLOCK constraint.
+		lineno	= input line number
+		from	= input fake address
+		to	= input fake address
+		n	= positive integer
+	    In the final address assignment, the instruction "to" must 
+		have the same leading address bits as "from". 
+		Specifically, ("to" div n) = ("from" div n). 
+
+		example:
+			B 2261 15 16 128	15 in same page as 16
+
+	A = ALIGNMENT constraint.
+		lineno	= input line number
+		from	= input fake address
+		off	= UNUSED
+		align	= *01 notation converted to number
+	    In the final address assignment, the instruction at "from" 
+		must be assigned an address "off" past an address
+		matching the alignment expression. This is used mostly 
+		for targets of cases and multiple returns. The offset is 
+		to allow the first such target to be unused. The "*01" 
+		notation of Micro-2 is converted to a number by treating 
+		those 3 characters as base-3 digits: "*" = 0, "0" = 1,
+		"1" = 2. Thus, 01*0 becomes 1*27 + 2*9 + 0*3 + 1*1 = 46.
+	
+		example:
+			A 2262 1 17 46	17 is to be one 
+						instruction past =01*0.
+
+
+TRANSFORMATIONS MADE BY THIS PASS:
+
+	For each incoming AT constraint followed by an instruction at 
+		address A, generate: R abs_zero A 
+	For:
+						;2257 ;= AT 1220 (hex)
+		U 0012, xxxx,xxxx,xxxx,xxxx	;2258 ...
+	generate
+		R 2257 -1 0018 4640 4640 
+			   /\
+			(decimal)
+
+	For:
+						;2257 ;= AT 1220
+						;2258 ;= ALIGNLIST 0*10 (A,B,,D)
+	generate
+		R 2257 -1 a 4640 4640 
+		A 2258 -1 a 0 34
+		R 2258  a b 1 1 
+		R 2258  a d 9 9 
+	where a,b, and d are the Micro-2-assigned addresses for labels 
+		A,B, and D.
+
+	For:
+						;2259 ;= REGION E-5 E+5
+						;2260 ;= BEGIN
+		U 0012, xxxx,xxxx,xxxx,xxxx	;2261 ...
+		U 0013, xxxx,xxxx,xxxx,xxxx	;2262 ...
+						;2263 ;= END
+	generate
+		R 2259 e 0018 -5 5 
+		R 2259 e 0019 -5 5 
+				where "e" is the fake address of label "E"
+
+LINKING
+
+
+	The address allocator includes the ability to do asymmetrical 
+	linking: on top of some existing microcode with final addresses, 
+	a new bunch of microcode may be allocated.
+
+
+		source 1	source 2	source 3
+		   |		   |		   |
+		Micro-2		Micro-2		Micro-2
+		   |		   |		   |
+		64-bit		64-bit		64-bit
+		.ULD		.ULD		.ULD
+		   |		   |		   |
+	    null   |		   |		   |
+	    .ULD   |		   |		   |
+		\  |		   |		   |
+		ALLOC		   |		   |
+		   |		   |		   |
+		40-bit		   |		   |
+		.ULD		   |		   |
+		   \__________     |		   |
+			      \ ALLOC		   |
+				   |		   |
+				40-bit		   |
+				.ULD		   |
+				   \__________	   |
+					      \ ALLOC
+						   |
+						40-bit
+						.ULD
+
+	The goals of this process include:
+		1. Allow separate Micro-2 assemblies
+		2. Allow linking of GLOBAL and EXTERNAL labels
+		3. Allow re-linking of new code on top of a stable base.
+		4. Allow overwriting of old code with patches
+		5. Be available for other processors than Scorpio.
+		6. Concatinating all the source files should yield a 
+		   valid Micro-2 source, without duplicate labels.
+
+	In order to avoid dependence on Scorpio microcode bit patterns, 
+	source label spellings are used to denote globals and externals:
+
+		Labels ending in ".." or "__" are GLOBAL labels, meaning 
+			that references in separate assemblies are 
+			eventually be be reolved to the microinstruction 
+			that this label is attached to.
+		Labels containing ".." or "__" followed by more letters 
+			are EXTERNAL labels, meaning that they are 
+			eventually to be resolved to globals possibly 
+			declared in a separate assembly.
+
+	Intended use:
+
+		source 1	source 2	source 3
+		 ...		 ...		 ...
+		X__: 		goto X__2	goto X__3
+		 real_uinst	 ...		 ...
+				X__2:		X__3:
+				 dummy_unist	 dummy_uinst
+
+
+*/
+
+%replace false by '0'b;
+%replace true  by '1'b;
+
+%replace allocated_memory by 'E';	/* Letter for memory that we are converting */
+
+%replace call_delta by 2048;		/* Delta constraint to generate for uCALL */
+
+%replace lbl_from by 1;
+%replace lbl_to   by 2;
+
+%replace h1_file_col 	by 1;		/* heading line columns	*/
+%replace h1_text_col	by 29;		/* ZERO-origin !	*/
+%replace h1_date_col	by 47;
+%replace h1_time_col	by 58;
+%replace h1_page_col	by 123;		/* "Page"		*/
+%replace h1_pageno_col	by 127;
+%replace h2_file_col	by 1;
+%replace h2_text_col	by 29;
+
+%replace h1_file_len	by 28;		/* heading line lengths	*/
+%replace h1_text_len	by 18;		/* ONE-origin (true len)*/
+%replace h1_date_len	by 9;
+%replace h1_time_len	by 8;
+%replace h1_page_len	by 4;
+%replace h1_pageno_len	by 5;
+%replace h2_file_len	by 28;
+%replace h2_text_len	by 103;
+
+%replace unknown by -3;
+%replace addr_zero by -1;
+
+
+%replace next_uinst	by '_NEXT_UINST_';
+
+%replace t_name 	by 1;		/* must be first */
+%replace t_numb 	by 2;
+%replace t_lpar 	by 3;
+%replace t_rpar 	by 4;
+%replace t_plusm 	by 5;
+%replace t_comma 	by 6;
+%replace t_eoln 	by 7;
+%replace t_other 	by 8;		/* must be last */
+
+%replace ps_init	by 1;		/* must be first */
+%replace ps_begin	by 2;
+%replace ps_end		by 3;
+%replace ps_at		by 4;
+%replace ps_region	by 5;
+%replace ps_align	by 6;
+%replace ps_atlbl	by 7;
+%replace ps_atlblpm	by 8;
+%replace ps_rlbl1	by 9;
+%replace ps_rdone1	by 10;
+%replace ps_rnumb1	by 11;
+%replace ps_rlbl1pm	by 12;
+%replace ps_rlbl2	by 13;
+%replace ps_rlbl2pm	by 14;
+%replace ps_align1	by 15;
+%replace ps_align2	by 16;
+%replace ps_albl	by 17;
+%replace ps_tf		by 18;
+%replace ps_pm		by 19;
+%replace ps_error	by 20;
+%replace ps_eatit	by 21;
+%replace ps_tail	by 22;		/* must be last */
+
+%replace ac_nothing	by 0;
+%replace ac_init	by 1;
+%replace ac_begin	by 2;
+%replace ac_end		by 3;
+%replace ac_at		by 4;
+%replace ac_region	by 5;
+%replace ac_align	by 6;
+%replace ac_atlbl	by 7;
+%replace ac_atlblpm	by 8;
+%replace ac_rlbl1	by 9;
+%replace ac_rdone1	by 10;
+%replace ac_rlbl1pm	by 11;
+%replace ac_rlbl2	by 12;
+%replace ac_rlbl2pm	by 13;
+%replace ac_align1	by 14;
+%replace ac_align2	by 15;
+%replace ac_albl	by 16;
+%replace ac_alblpm	by 17;
+%replace ac_aexpr	by 18;
+%replace ac_tf		by 19;
+%replace ac_pm		by 20;
+%replace ac_error	by 21;
+%replace ac_tail	by 22;
+%replace ac_atnumb0	by 23;
+%replace ac_atnumb1	by 24;
+%replace ac_setlast	by 25;
+%replace ac_xxxx	by 26;
+
+%replace ac_rlbl	by 27;
+%replace ac_rnumb	by 28;
+%replace ac_setlast	by 29;
+%replace ac_ulohi	by 30;
+%replace ac_ulo		by 31;
+%replace ac_uhi		by 32;
+%replace ac_flush	by 33;
+%replace ac_incr	by 34;
+
+
+DCL PME_init ENTRY();
+DCL PME_exit ENTRY();
+DCL this_is_lit BIT(1) ALIGNED;		/* true if next uword is 40-bit literal */
+
+dcl	debug		char(30) var;	/* debugging options	*/
+dcl	buf		char(255) var;	/* input text line */
+
+dcl	current_date	char(9);	/* postpass date 12-OCT-81 */
+dcl	current_time	char(8);	/* postpass time 11:47:15 */
+
+DCL	no_time_stamp	BIT(1) ALIGNED;	/* True until first heading_1 line */
+DCL	time_stamp	CHAR(31) VAR;	/* Original Micro-2 time stamp */
+dcl	current_page	fixed bin(31);	/* current page number heading1 128..132*/
+dcl	current_line	fixed bin(31);	/* current line within a page */
+dcl	current_lineno	fixed bin(31);	/* current Micro-2 line number */
+dcl	current_h1_file	char(28);	/* heading1 2..29 */
+dcl	current_h1_text	char(18) var;	/* heading2 30..47 */
+dcl	current_h2_file char(28);	/* heading2 2..29 */
+dcl	current_h2_text	char(103) var;	/* heading2 30..132 */
+dcl	at_heading1	bit(1);		/* true if buf_window = 1st heading */
+dcl	at_heading2	bit(1);		/* true if buf_window = 2nd heading */
+
+dcl	current_umem	char(1);	/* extracted micro memory */
+dcl	current_uaddr	fixed bin(31);	/* extracted micro address */
+dcl	current_ubits	bit(128);	/* extracted micro instruction,
+					    left justified */
+
+dcl	1 buf_window,			/* part before possible FF */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 unused_buf_window,		/* part after possible FF */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 ucode_window,			/* microcode area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 uaddr_window,			/* microcode address area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 ubits_window,			/* microcode bits area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 lineno_window,		/* line number area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 text_window,			/* source text area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 label_window,			/* source label area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+
+dcl	1 scomment_window,		/* stylized comment area */
+	  2 start fixed bin(31),	/* window into buf */
+	  2 len fixed bin(31);
+/*
+EXAMPLE:
+
+				;2109	FSD.R.OCTA:					;= AT F+6
+				;2110		;---------------------------------------;
+U 016, 01A0,0420,0017,0017	;2111		RN<--RN+1				; incr RN to pt to 1 below next reg to fill
+|---------------------------------------------------------------- buf -------------------------------------------------------------|
+|-----------------------------| ucode_window
+  |-|				uaddr_window
+       |----------------------| ubits_window
+
+
+				;2109	FSD.R.OCTA:					;= AT F+6
+				;2110		;---------------------------------------;
+U 016, 01A0,0420,0017,0017	;2111		RN<--RN+1				; incr RN to pt to 1 below next reg to fill
+|---------------------------------------------------------------- buf -------------------------------------------------------------|
+lineno_window			 |-----|
+text_window				|------------------------------------------------------------------------------------------|
+label_window (shrinks)			|------------------------------------------------------------------------------------------|
+					|--------|
+scomment_window	(shrinks)		|------------------------------------------------------------------------------------------|
+											   |----|
+
+END EXAMPLE
+*/
+
+
+dcl null builtin;
+dcl (infile,adrfile,confile,extfile) file;
+dcl (inname,adrname,conname,extname,logname) char(80) var;
+dcl eof bit(1);
+dcl myeof bit(1);
+dcl (tab,ff) char(1);
+dcl is_hexchar(0:255) bit(1) aligned;
+dcl is_decchar(0:255) bit(1);
+dcl hextable(0:255) fixed bin(31);
+dcl bittable(0:15) bit(4) aligned;
+dcl (starts_name,starts_name_or_numb,in_name) (0:255) bit(1) aligned;
+DCL this_instr_has_z_constr BIT(1) ALIGNED;
+
+dcl hash_anchor(0:1023) ptr;
+
+dcl 1 symtab based,
+	2 hash_link ptr,
+	2 name char(31) var,
+	2 fake_addr fixed bin(31),
+	2 line_no fixed bin(31),
+	2 waiting_link ptr;
+
+dcl 1 cons based,
+	2 car ptr,
+	2 cdr ptr;
+
+dcl pending_labels ptr;
+dcl pending_constraints ptr;
+
+dcl 1 field(0:99), 2 start fixed bin(31), 2 len fixed bin(31);
+dcl action_list ptr;
+
+dcl p ptr;
+dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+dcl 1 bitpat based,
+	2 link ptr,
+	2 action_number fixed bin(31),
+	2 mask_eq bit(128),
+	2 data_eq bit(128),
+	2 mask_neq1 bit(128),
+	2 data_neq1 bit(128),
+	2 mask_neq2 bit(128),
+	2 data_neq2 bit(128),
+	2 mask_neq3 bit(128),
+	2 data_neq3 bit(128);
+
+dcl (has_misc_field, has_load_id, has_true_label, has_false_label) bit(1);
+
+dcl to_upper		char(255) var;
+dcl from_lower		char(255) var;
+dcl starts_name_str	char(255) var;
+dcl starts_numb_str	char(255) var;
+dcl starts_name_or_numb_str	char(255) var;
+dcl in_name_str		char(255) var;
+
+
+dcl token_type_tbl(0:255) fixed bin(31);
+
+dcl name_stack_ptr fixed bin(31);
+dcl name_stack(0:15) char(31) var;	/* name of each begin/end block	*/
+dcl constraint_stack(0:15) ptr;		/* constraints on each "    "	*/
+dcl line_stack(0:15) fixed bin(31);	/* line number of begin		*/
+DCL constraint_count FIXED BIN(31);	/* number of constraints written*/
+
+/* --------------------------------------------------------------------	*/
+/*		begin stylized comment globals				*/
+/* --------------------------------------------------------------------	*/
+
+dcl sc_parse_state fixed bin(31);
+dcl last_token char(31) var;
+dcl current_constraint ptr;
+dcl p_next_uinst ptr;
+dcl first_label bit(1);
+dcl base_label char(31) var;
+dcl base_offset fixed bin(31);
+dcl (align_counter, alignval, countval) fixed bin(31);
+
+/* --------------------------------------------------------------------	*/
+/*		end stylized comment globals				*/
+/* --------------------------------------------------------------------	*/
+
+dcl sc_next_state_tbl (ps_init:ps_tail, t_name:t_other) fixed bin(31)
+	static readonly initial(
+
+/*	|	t_name      t_numb      t_lpar      t_rpar      t_plusm     t_comma     t_eoln      t_other      */
+/* -----+------------------------------------------------------------------------------------------------------- */
+/* init | */	ps_init,    ps_error,   ps_error,   ps_error,   ps_pm,      ps_error,   ps_init,    ps_error,   
+/* begin| */	ps_tail,    ps_error,   ps_error,   ps_error,   ps_error,   ps_error,   ps_begin,   ps_error,   
+/* end  | */	ps_tail,    ps_error,   ps_error,   ps_error,   ps_error,   ps_error,   ps_end,     ps_error,   
+/* at   | */	ps_atlbl,   ps_tail,    ps_error,   ps_error,   ps_error,   ps_error,   ps_at,      ps_error,   
+/*region| */	ps_rlbl1,   ps_rnumb1,  ps_error,   ps_error,   ps_error,   ps_error,   ps_region,  ps_error,   
+/* align| */	ps_align1,  ps_align1,  ps_error,   ps_error,   ps_error,   ps_error,   ps_align,   ps_error,   
+/* atlbl| */	ps_error,   ps_error,   ps_error,   ps_error,   ps_atlblpm, ps_error,   ps_init,    ps_error,   
+/*tlblpm| */	ps_error,   ps_tail,    ps_error,   ps_error,   ps_error,   ps_error,   ps_atlblpm, ps_error,   
+/* rlbl1| */	ps_rlbl2,   ps_error,   ps_error,   ps_error,   ps_rlbl1pm, ps_error,   ps_rlbl1,   ps_error,   
+/*rdone1| */	ps_rlbl2,   ps_error,   ps_error,   ps_error,   ps_error,   ps_error,   ps_rdone1,  ps_error,   
+/*rnumb1| */	ps_error,   ps_tail,    ps_error,   ps_error,   ps_error,   ps_error,   ps_rnumb1,  ps_error,   
+/*rbl1pm| */	ps_error,   ps_rdone1,  ps_error,   ps_error,   ps_error,   ps_error,   ps_rlbl1pm, ps_error,   
+/* rlbl2| */	ps_error,   ps_error,   ps_error,   ps_error,   ps_rlbl2pm, ps_error,   ps_init,    ps_error,   
+/*.bl2pm| */	ps_error,   ps_tail,    ps_error,   ps_error,   ps_error,   ps_error,   ps_rlbl2pm, ps_error,   
+/*align1| */	ps_error,   ps_error,   ps_align2,  ps_error,   ps_error,   ps_error,   ps_align1,  ps_error,   
+/*align2| */	ps_albl,    ps_albl,    ps_error,   ps_tail,    ps_error,   ps_align2,  ps_align2,  ps_error,   
+/* albl | */	ps_error,   ps_error,   ps_error,   ps_tail,    ps_error,   ps_align2,  ps_albl,    ps_error,   
+/* tf   | */	ps_error,   ps_error,   ps_error,   ps_error,   ps_error,   ps_error,   ps_init,    ps_error,   
+/* pm   | */	ps_error,   ps_error,   ps_error,   ps_error,   ps_pm,      ps_error,   ps_init,    ps_error,   
+/* error| */	ps_error,   ps_error,   ps_error,   ps_error,   ps_error,   ps_error,   ps_init,    ps_error,   
+/* eatit| */	ps_eatit,   ps_eatit,   ps_eatit,   ps_eatit,   ps_eatit,   ps_eatit,   ps_init,    ps_eatit,
+/* tail | */	ps_error,   ps_error,   ps_error,   ps_error,   ps_error,   ps_error,   ps_init,    ps_error	);
+
+dcl sc_action_tbl     (ps_init:ps_tail, t_name:t_other) fixed bin(31)
+	static readonly initial(
+
+/*	|	t_name      t_numb      t_lpar      t_rpar      t_plusm     t_comma     t_eoln      t_other      */
+/* -----+------------------------------------------------------------------------------------------------------- */
+/* init | */	ac_nothing, ac_error,   ac_error,   ac_error,   ac_pm,      ac_error,   ac_nothing, ac_error,   
+/* begin| */	ac_begin,   ac_error,   ac_error,   ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/* end  | */	ac_end,     ac_error,   ac_error,   ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/* at   | */	ac_rlbl,    ac_rnumb,   ac_error,   ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/*region| */	ac_rlbl,    ac_rnumb,   ac_error,   ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/* align| */	ac_align1,  ac_align1,  ac_error,   ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/* atlbl| */	ac_error,   ac_error,   ac_error,   ac_error,   ac_setlast, ac_error,   ac_flush,   ac_error,   
+/*tlblpm| */	ac_error,   ac_ulohi,   ac_error,   ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/* rlbl1| */	ac_rlbl2,   ac_error,   ac_error,   ac_error,   ac_setlast, ac_error,   ac_nothing, ac_error,   
+/*rdone1| */	ac_rlbl2,   ac_error,   ac_error,   ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/*rnumb1| */	ac_error,   ac_uhi,     ac_error,   ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/*rbl1pm| */	ac_error,   ac_ulo,     ac_error,   ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/* rlbl2| */	ac_error,   ac_error,   ac_error,   ac_error,   ac_setlast, ac_error,   ac_flush,   ac_error,   
+/*.bl2pm| */	ac_error,   ac_uhi,     ac_error,   ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/*align1| */	ac_error,   ac_error,   ac_nothing, ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/*align2| */	ac_albl,    ac_albl,    ac_error,   ac_flush,   ac_error,   ac_incr,    ac_nothing, ac_error,   
+/* albl | */	ac_error,   ac_error,   ac_error,   ac_flush,   ac_error,   ac_incr,    ac_nothing, ac_error,   
+/* tf   | */	ac_error,   ac_error,   ac_error,   ac_error,   ac_error,   ac_error,   ac_nothing, ac_error,   
+/* pm   | */	ac_error,   ac_error,   ac_error,   ac_error,   ac_pm,      ac_error,   ac_nothing, ac_error,   
+/* error| */	ac_nothing, ac_nothing, ac_nothing, ac_nothing, ac_nothing, ac_nothing, ac_nothing, ac_nothing, 
+/* eatit| */	ac_nothing, ac_nothing, ac_nothing, ac_nothing, ac_nothing, ac_nothing, ac_nothing, ac_nothing,
+/* tail | */	ac_error,   ac_error,   ac_error,   ac_error,   ac_error,   ac_error,   ac_flush,   ac_error	);
+
+
+
+dcl 1 constraint based(current_constraint),	/* waiting to be sent 	*/
+	2 type char(1),				/* A, B, or R		*/
+	2 line_no fixed bin(31),		/* where it came from	*/
+	2 from,					/* from location	*/
+		3 fake_addr fixed bin(31),	/* resolved to fake addr*/
+		3 lbl	    ptr,		/* unresolved symtab ptr*/
+	2 to,					/* to location		*/
+		3 fake_addr fixed bin(31),	/* resolved to fake addr*/
+		3 lbl	    ptr,		/* unresolved symtab ptr*/
+	2 del fixed bin(31);			/* delta        	*/
+						/*  or align alignment	*/
+
+
+backpatch_label : proc(p);
+	/* if any constraints are waiting on label p to become	*/
+	/*  defined, now is the time to fill them in.		*/
+	dcl p ptr;
+	dcl (q,r) ptr;
+
+if index(debug,'C')^=0 then
+PUT  EDIT('Backpatch label: ',p->symtab.name) (a,a);
+
+	q = p -> symtab.waiting_link;
+	do while (q^=null);
+		r = q -> cons.car;
+		/* r now points to some constraint */
+if index(debug,'C')^=0 then
+PUT  EDIT(dump_ptr(r)) (x(1),a);
+		if r -> constraint.from.lbl = p then
+		    do;
+if index(debug,'C')^=0 then
+PUT  EDIT('.') (a);
+			r -> constraint.from.fake_addr = p -> symtab.fake_addr;
+			r -> constraint.from.lbl       = null;
+		    end;
+		if r -> constraint.to.lbl = p then
+		    do;
+if index(debug,'C')^=0 then
+PUT  EDIT(':') (a);
+			r -> constraint.to.fake_addr = p -> symtab.fake_addr;
+			r -> constraint.to.lbl       = null;
+		    end;
+		CALL finish_constraint(r);
+
+		r = q -> cons.cdr;
+		FREE q->cons;
+		q = r;		
+	end; /* do while q */
+	p -> symtab.waiting_link = null;
+if index(debug,'C')^=0 then
+PUT  SKIP;
+end; /* backpatch_label */
+
+
+backpatch_ucode : proc;
+	/* use the microinstruction just parsed to fill in	*/
+	/*  pending label definitions, and output relations.	*/
+	dcl (p,q) ptr;
+	dcl is_new bit(1);
+
+	q = pending_labels;
+	do while(q^=null);
+		p = q->cons.car;
+		/* p now points to a waiting label symbol tbl entry */
+		if p->symtab.fake_addr=unknown then
+		    do; /* we are now defining it */
+			p->symtab.fake_addr = current_uaddr;
+			p->symtab.line_no   = current_lineno;
+			CALL backpatch_label(p);
+			if (index(p->symtab.name,'..')^=0) |
+			   (index(p->symtab.name,'__')^=0)   then
+				CALL put_ext(p->symtab.fake_addr,p->symtab.name);
+		    end; /* we are now defining it */
+		else
+			call error_msg('DUPLICATE LABEL ',p->symtab.name);
+		p = q->cons.cdr;
+		FREE q->cons;
+		q = p;
+	end;
+
+	pending_labels = null;
+
+	/* flush out constraints waiting on current microinstruction */
+	p_next_uinst -> symtab.fake_addr = current_uaddr;
+	p_next_uinst -> symtab.line_no   = current_lineno;
+	CALL backpatch_label(p_next_uinst);
+	p_next_uinst -> symtab.fake_addr = unknown;
+	p_next_uinst -> symtab.line_no   = unknown;
+
+end; /* backpatch_ucode */
+
+
+
+charval : proc(w) returns(char(1));
+	/* pick off first char in window, or blank. UPDATE w	*/
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl c char(1);
+
+	if w.len>0 then
+	    do;
+		c = substr(buf,w.start,1);
+		w.start = w.start+1;
+		w.len   = w.len-1;
+		return(c);
+	    end;
+	else
+	    return(' ');
+end; /* charval */
+
+
+check_symtab : proc;
+	dcl (p,q,r) ptr;
+	dcl i fixed bin(31);
+
+	do i = name_stack_ptr-1 to 1 by -1;
+		CALL error_msg('Unmatched BEGIN from',
+		char(dec(line_stack(i),5)) ||' '|| 
+		name_stack(i) );
+	end; /* do i */
+
+	do i = 0 to 1023;
+		if hash_anchor(i)^=null then
+		do;
+		p = hash_anchor(i);
+		do while(p^=null);
+			current_lineno = p -> symtab.line_no;
+			if p -> symtab.fake_addr = unknown then
+				if p^=p_next_uinst then
+					CALL error_msg('Unresolved label: ',
+						p -> symtab.name);
+			q = p -> symtab.waiting_link;
+			if q^=null then
+			do;
+				CALL error_msg('Waiting constraints: ',
+					p -> symtab.name);
+				do while(q^=null);
+					r = q->cons.car;
+					CALL error_msg('  constraint at ',
+					    char(dec(r->constraint.line_no,5)));
+					q = q->cons.cdr;
+				end; /* while q */
+			end;
+			p = p->symtab.hash_link;
+		end; /* while p */
+		end;
+	end; /* do i */
+end; /* check_symtab */
+
+
+decompose_heading_line : proc(w);
+	/* pick all the fields out of a heading line */
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl t char(31) var;	/* temp for safe char convert */
+
+/* put skip  edit ('DECOMP_HEAD:') (a); */
+	at_heading2 = at_heading1;	/* previous line =1, this=2	*/
+	at_heading1 = ^ at_heading1;	/* previous line ^=1, this=1	*/
+	ucode_window.start = w.start;
+	ucode_window.len   = 0;
+	lineno_window.start = w.start;
+	lineno_window.len   = 0;
+	text_window.start = w.start;
+	text_window.len   = 0;
+	if at_heading1 then
+	    do; /* decomp heading1 */
+		t = substr(buf,w.start+h1_pageno_col,
+					h1_pageno_len);
+		if verify(t,'0123456789 ')=0 then
+			current_page = bin(t);
+/*		else
+			call error_msg('BAD PAGE # ',t); */
+		current_h1_file = substr(buf,w.start+h1_file_col,
+					h1_file_len);
+		current_h1_text = substr(buf,w.start+h1_text_col,
+					h1_text_len);
+		IF no_time_stamp THEN
+		    DO;
+			no_time_stamp = false;
+			/* stupid Micro-2 has 2 blanks between d/t here, 1 in uld */
+			time_stamp = SUBSTR(buf,w.start+h1_date_col,10) ||
+				     SUBSTR(buf,w.start+h1_time_col,8);
+			put edit('.MCR Time stamp = "',time_stamp,'"') (A,A,A);
+			put skip;
+			put file(adrfile) edit('; ',time_stamp) (a,a);
+			put file(adrfile) skip;
+			put file(confile) edit('; ',time_stamp) (a,a);
+			put file(confile) skip;
+			put file(extfile) edit('; ',time_stamp) (a,a);
+			put file(extfile) skip;
+		    END;
+	    end; /* heading1 */
+	else
+	    do; /* decomp heading2 */
+		current_h2_file = substr(buf,w.start+h2_file_col,
+					min(h2_file_len,
+					max(w.len-h2_file_col,0)));
+		current_h2_text = substr(buf,w.start+h2_text_col,
+					min(h2_text_len,
+					max(w.len-h2_text_col,0)));
+	    end; /* heading2 */
+/* put skip  list(current_h1_file,current_h1_text,current_page);
+put skip  list(current_h2_file,current_h2_text);
+put skip  list(at_heading1,at_heading2);
+put skip ; */
+end; /* decompose_heading_line */
+
+
+
+decompose_line : proc(w);
+	/* From the window w, extract ucode_window, and text_window	*/
+	/* Also set current_page, current_line, at_heading1/2		*/
+	/*  current_lineno						*/
+	/* If heading, do current_h* fields.				*/
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 local_w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	current_line = current_line+1;
+	local_w = w;		/* copy is modified by is_heading_line  ! */
+	if is_heading_line(local_w) then
+		call decompose_heading_line(local_w);
+	else
+		call decompose_other_line(local_w);
+
+end; /* decompose_line */
+
+
+decompose_other_line : proc(w);
+	/* pick all the fields out of a non-heading line */
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl i fixed bin(31);
+	dcl t char(31) var;	/* temp for safe char convert */
+
+/* put skip  edit ('DECOMP_OTHER:') (a); */
+	at_heading1 = false;		/* safety move			*/
+	at_heading2 = false;		/* safety move			*/
+
+	/* NOTE: the test below depends on compiled code branching out
+		on length=0, OR no subscriptrange checking */
+	if (w.len>0) & (substr(buf,w.start,1)=';') then
+	    do; /* .nobin line */
+		ucode_window.start = w.start;
+		ucode_window.len   = 0;
+		lineno_window.start = w.start+1;
+		lineno_window.len   = min(w.len-1,7);
+		text_window.start = w.start+8;
+		text_window.len   = max(w.len-8,0);
+		t = substr(buf,
+			lineno_window.start,lineno_window.len);
+		if verify(t,'0123456789 ')=0 then
+			current_lineno = bin(t);
+/*		else
+			call error_msg('BAD LINE # ',t); */
+	    end; /* .nobin line */
+	else
+	    do; /* .bin line or blank */
+		/* look for ucode, lineno separator */
+		i = index(substr(buf,w.start,w.len),';');
+		if i=0 then
+		    do; /* no separator -- treat as blank */
+			ucode_window.start = w.start;
+			ucode_window.len   = 0;
+			lineno_window.start = w.start;
+			lineno_window.len   = 0;
+			text_window.start = w.start;
+			text_window.len   = w.len;
+			/* don't change current_lineno */
+		    end; /* no separator */
+		else
+		    do; /* .bin line */
+			ucode_window.start = w.start;
+			ucode_window.len   = i-1;
+			lineno_window.start = w.start+i;	/* after ; */
+			lineno_window.len   = min(w.len-i,7);
+			text_window.start = w.start+(i-1)+8;	/* ; + 8   */
+			text_window.len   = max(w.len-(i-1)-8,0);
+			t = substr(buf,
+				lineno_window.start,lineno_window.len);
+			if verify(t,'0123456789 ')=0 then
+				current_lineno = bin(t);
+/*			else
+				call error_msg('BAD LINE # ',t); */
+		    end; /* .bin line */
+	    end; /* .bin line or blank */
+/* put skip ;
+put skip  edit(buf) (a);
+call putwindow(ucode_window,'u');
+call putwindow(lineno_window,'#');
+call putwindow(text_window,'t');
+put skip  edit('lineno=',current_lineno) (a,a); */
+end; /* decompose_other_line */
+
+
+
+decval : proc(s,w) returns(fixed bin(31));
+	/* pick off first dec const in window, or 0. UPDATE w	*/
+	/* skips over leading non-dec chars			*/
+	/* leaves w pointing to first non-dec char in window	*/
+
+	dcl s char(255) var;
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl i fixed bin(31), c char(1);
+
+	i = 0;
+	do while( (w.len>0) & ^is_decchar(rank(substr(s,w.start,1))) );
+		w.start = w.start+1;
+		w.len   = w.len-1;
+	end;
+	do while( (w.len>0) & is_decchar(rank(substr(s,w.start,1))) );
+		c = substr(s,w.start,1);
+		i = i*10 + rank(c) - rank('0');
+		w.start = w.start+1;
+		w.len   = w.len-1;
+	end;
+	return(i);
+end; /* decval */
+
+
+dump_bits : proc(b);
+	/* print bitstring */
+	dcl b bit(128);
+
+	put skip edit(b)(a);
+end; /* dump_bits */
+
+
+dump_buckets : proc;
+	/* print picture of symbol table */
+	dcl i fixed bin(31), p ptr;
+
+	put  skip;
+	put  edit('SYMTAB BUCKETS:') (a);
+	put  skip;
+	do i = 0 to 1023;
+		if hash_anchor(i)^=null then
+		    do;
+			put  edit(i,' ') (f(4),a);
+			p = hash_anchor(i);
+			do while(p^=null);
+				put  edit('x') (a); 
+				p = p->symtab.hash_link;
+			end;
+			put  skip;
+		    end;
+	end;
+end; /* dump_buckets */
+
+
+dump_ptr : proc(p) returns(char(31)var);
+	/* convert a pointer to 8 hex chars */
+	dcl p ptr;
+	dcl c char(31)var;
+	put string(c) edit(unspec(p)) (b4);
+	return(c);
+end; /* dump_ptr */
+
+
+enqueue : proc(anchor,p);
+	/* add p to linked list anchor */
+	dcl (anchor,p) ptr;
+	dcl q ptr;
+
+	allocate cons set(q);
+	q->cons.car = p;
+	q->cons.cdr = anchor;
+	anchor = q;
+end; /* enqueue */
+
+
+epilogue : proc;
+if index(debug,'S')^=0 then
+	call dump_buckets;
+call check_symtab;
+
+close file(infile);
+close file(adrfile);
+close file(confile);
+close file(extfile);
+end; /* epilogue */
+
+
+error_msg : proc(s1,s2);
+	/* print an error message and return */
+	dcl (s1,s2) char(31) var;
+	put  edit('*** line', current_lineno,s1,s2) 
+			(a,f(6),x(1),a,a); put  skip; 
+end; /* error_msg */
+
+
+extract_pattern : proc(s) returns(ptr);
+	/* read in a single bit pattern from string s. */
+	/* if blank line or one that starts with a ';', return null,
+	   else return ptr to bitpat */
+
+/*
+	x = don't care
+	0 1 = must be zero/one
+	, ' = the complete field must NOT equal the corresponding 0,1 pattern
+	- | = the complete field must NOT equal the corresponding 0,1 pattern
+	. ^ = the complete field must NOT equal the corresponding 0,1 pattern
+*/
+
+	dcl s char(255) var;
+	dcl p ptr, (i,k) fixed bin(31), c char(1);
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	if length(s)=0 then
+		return(null);
+	if substr(s,1,1) = ';' then
+		return(null);
+
+	w.start = 1;  w.len = length(s);
+
+	allocate bitpat set(p);
+	p->bitpat.link = null;
+	p->bitpat.action_number = decval(s,w);
+	p->bitpat.mask_eq	= '0'b;
+	p->bitpat.data_eq	= '0'b;
+	p->bitpat.mask_neq1	= '0'b;
+	p->bitpat.data_neq1	= '0'b;
+	p->bitpat.mask_neq2	= '0'b;
+	p->bitpat.data_neq2	= '0'b;
+	p->bitpat.mask_neq3	= '0'b;
+	p->bitpat.data_neq3	= '0'b;
+
+	k = 0;
+	do i=w.start to w.start+w.len-1;
+		c = substr(s,i,1);
+		if index (' xX01,''-|.^',c)=0 then goto exit_label;
+		if index ('xX01,''-|.^',c)^=0 then k = k+1;
+		if c='0' then
+		    do; substr(p->bitpat.mask_eq,k,1) = '1'b;
+			substr(p->bitpat.data_eq,k,1) = '0'b; end;
+		if c='1' then
+		    do; substr(p->bitpat.mask_eq,k,1) = '1'b;
+			substr(p->bitpat.data_eq,k,1) = '1'b; end;
+		if c=',' then
+		    do; substr(p->bitpat.mask_neq1,k,1) = '1'b;
+			substr(p->bitpat.data_neq1,k,1) = '0'b; end;
+		if c='''' then
+		    do; substr(p->bitpat.mask_neq1,k,1) = '1'b;
+			substr(p->bitpat.data_neq1,k,1) = '1'b; end;
+		if c='-' then
+		    do; substr(p->bitpat.mask_neq2,k,1) = '1'b;
+			substr(p->bitpat.data_neq2,k,1) = '0'b; end;
+		if c='|' then
+		    do; substr(p->bitpat.mask_neq2,k,1) = '1'b;
+			substr(p->bitpat.data_neq2,k,1) = '1'b; end;
+		if c='.' then
+		    do; substr(p->bitpat.mask_neq3,k,1) = '1'b;
+			substr(p->bitpat.data_neq3,k,1) = '0'b; end;
+		if c='^' then
+		    do; substr(p->bitpat.mask_neq3,k,1) = '1'b;
+			substr(p->bitpat.data_neq3,k,1) = '1'b; end;
+		/* if c='x' or c='X' or c=' ' then do nothing further */
+	end; /* char loop */
+exit_label:
+	return(p);
+end; /* extract_pattern */
+
+
+find_field : proc(p,w);
+	/* returns a window to the first field in mask_eq */
+	dcl p ptr;
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	if p=null then
+		do; w.start = 1; w.len = 0; end;
+	else
+	    do;
+		w.start = index(p->bitpat.mask_eq, '1'b);
+		if w.start=0 then
+			do; w.start = 1; w.len = 0; end;
+		else
+			w.len = index( substr(p->bitpat.mask_eq,w.start), '0'b) - 1;
+	    end;
+/* put skip list('find_field: ', w.start, w.len, p->bitpat.mask_eq); */
+end; /* find_field */
+
+
+finish_constraint : proc(p);
+	dcl p ptr;
+
+if index(debug,'C')^=0 then
+do; 	PUT  EDIT('finish_constraint: ',dump_ptr(p)) (a,a);
+	if p->constraint.from.lbl^=null then
+	    PUT  EDIT(p->constraint.from.lbl->symtab.name) (x(1),a);
+	if p->constraint.to.lbl^=null then
+	    PUT  EDIT(p->constraint.to.lbl->symtab.name) (x(1),a);
+	PUT  SKIP; end;
+
+	IF (p -> constraint.from.lbl = null) &
+	   (p -> constraint.to.lbl = null)     THEN
+	    do; /* print constraint */
+		CALL put_con(p -> constraint.type,
+ 			     p -> constraint.line_no,
+			     p -> constraint.from.fake_addr,
+			     p -> constraint.to.fake_addr,
+			     p -> constraint.del
+			);
+		FREE p->constraint;
+		IF p=current_constraint THEN
+		    current_constraint = NULL;
+		p = NULL;
+	    end; /* print constraint */
+	/* ELSE it is queued waiting for some label -- leave it for later */
+end; /* finish_constraint */
+
+
+get_name : proc(w,l) returns(char(31)var);
+	/* put out name from buf, checking length			*/
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl l fixed bin(31);
+	dcl name char(31) var;
+
+	if w.len<=l then
+	    name = substr(buf,w.start,w.len);
+	else
+	    do;
+		call error_msg('NAME TOO LONG. TRUNCATED. ',
+			substr(buf,w.start,w.len));
+		name = substr(buf,w.start,l);
+	    end;
+	return(name);
+end; /* get_name */
+
+
+hashval : proc(n) returns(fixed bin(31));
+	/* hash name n. heavy weight on first char<3:0>, last char<3:0> */
+	/*  length<1:0>. result in range 0..1023 */
+	dcl n char(31) var;
+	dcl i fixed bin(31);
+
+	i = length(n);
+	if i>0 then
+		i = mod( rank(substr(n,1,1))*65 +
+			rank(substr(n,i,1))*4 + i, 1024 );
+	return(i);
+end; /* hashval */
+
+
+hexbits : proc(w) returns(bit(128));
+	/* pick off hex bitstring in w, or null. UPDATE w	*/
+	/* packs all hex chars into bitstring, skips all others	*/
+	/* w will always be empty on exit			*/
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl (i,k) fixed bin(31), c char(1);
+	dcl temp bit(128);
+	dcl temphex(0:31) bit(4) defined(temp);
+
+	temp = '0'b;
+	k = -1;
+	do i = w.start to w.start+w.len-1;
+		if is_hexchar(rank(substr(buf,i,1))) then
+		    do;
+			if k<31 then
+				k = k+1;
+			else
+				call error_msg('HEX TOO LONG ',substr(buf,i,1)) ;
+			temphex(k) = bittable(hextable(rank(substr(buf,i,1))));
+		    end;
+		else
+		    do;
+		    end;
+	end;
+	w.start = w.start + w.len;
+	w.len   = 0;
+	return(temp);
+end; /* hexbits */
+
+
+hexval : proc(w) returns(fixed bin(31));
+	/* pick off first hex const in window, or 0. UPDATE w	*/
+	/* skips over leading non-hex chars			*/
+	/* leaves w pointing to first non-hex char in window	*/
+	/* does not work for 8-digit negatives (overflows)	*/
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl i fixed bin(31), c char(1);
+
+	i = 0;
+	do while( (w.len>0) & ^is_hexchar(rank(substr(buf,w.start,1))) );
+		w.start = w.start+1;
+		w.len   = w.len-1;
+	end;
+	do while( (w.len>0) & is_hexchar(rank(substr(buf,w.start,1))) );
+		c = substr(buf,w.start,1);
+		i = i*16 + hextable(rank(c));
+		w.start = w.start+1;
+		w.len   = w.len-1;
+	end;
+	return(i);
+end; /* hexval */
+
+
+incr_align_counter : proc;
+	align_counter = (align_counter + countval) + 1;
+	unspec(align_counter) = unspec(align_counter) & ^ unspec(countval);
+if index(debug,'I')^=0 then
+do; PUT  EDIT('align_counter = ', align_counter) (a,f(6));
+PUT  SKIP; end;
+end; /* incr_align_counter */
+
+
+is_heading_line : proc(w) returns(bit(1));
+	/* returns true if we are at a heading line. 			*/
+	/* CHANGES w to skip over a leading FF char !			*/
+	/* CHANGES current_line if FF !					*/
+
+	/* because of Micro-2						*/
+	/*  bugs, there MAY be a normal text line at the top of a page, */
+	/*  followed by the normal two heading lines. Thus,		*/
+	/* A heading line is:						*/
+	/*	a line beginning with FF and col 124..127 = "Page", or	*/
+	/*	line 2 of a page and col 124..127 = "Page" and line 1	*/
+	/*		was not a heading, or				*/
+	/*	the line after one of the above.			*/
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	if w.len=0 then return(false);		/* blank line ^= heading*/
+
+	if substr(buf,w.start,1)=ff then
+	    do; /* first line of page, DO SIDE EFFECTS */
+		w.start = w.start+1; w.len = w.len-1;	/* get over FF	*/
+		current_line = 1;			/* reset count	*/
+	    end; /* first line of page */
+
+	if at_heading1 then /* previous line was heading1, so this is 2 */
+		return(true);
+	else do;
+  	   if (w.len>=(h1_page_col + 4))
+		then return( (current_line<=2) & (substr(buf,w.start+h1_page_col,4)='Page') );
+           else return(false);
+        end;
+end; /* is_heading_line */
+
+
+label_eq : proc(s) returns(bit(1));
+	/* returns true if current_constraint FROM label = s */
+	dcl s char(31) var;
+	dcl p ptr;
+	dcl is_new bit(1);
+
+	p = symtable(s,is_new);
+	if current_constraint -> constraint.from.lbl = null then
+		return(current_constraint->constraint.from.fake_addr =
+			p->symtab.fake_addr);
+	else
+		return(current_constraint->constraint.from.lbl = p);
+end; /* label_eq */
+
+
+make_constraint : proc(ptype,pf_lbl,pt_lbl,pdel);
+	dcl ptype char(1);
+	dcl (pf_lbl,pt_lbl) char(31) var;
+	dcl pdel fixed bin(31);
+
+	if current_constraint^=null then
+	    call finish_constraint(current_constraint);
+	ALLOCATE constraint SET(current_constraint);
+
+if index(debug,'C')^=0 then
+do;	PUT  EDIT('make_constraint: ',ptype,pf_lbl,pt_lbl,pdel)
+		(a,a,x(1),a,x(1),a,f(6));
+	PUT  EDIT(dump_ptr(current_constraint)) (x(1),a);
+	PUT  SKIP; end;
+
+	current_constraint -> constraint.type		= ptype;
+	current_constraint -> constraint.line_no	= current_lineno;
+	CALL resolve_label(current_constraint,lbl_from,pf_lbl);
+	CALL resolve_label(current_constraint,lbl_to  ,pt_lbl);
+	current_constraint -> constraint.del	= pdel;
+end; /* make_constraint */
+
+
+make_z_constraint : proc(ptype,pt_lbl,pdel);
+	dcl ptype char(1);
+	dcl pt_lbl char(31) var;
+	dcl pdel fixed bin(31);
+
+	if current_constraint^=null then
+	    call finish_constraint(current_constraint);
+	ALLOCATE constraint SET(current_constraint);
+
+if index(debug,'C')^=0 then
+do;	PUT  EDIT('make_z_constraint: ',ptype,pt_lbl,pdel)
+		(a,a,x(1),a,f(6));
+	PUT  EDIT(dump_ptr(current_constraint)) (x(1),a);
+	PUT  SKIP; end;
+
+	current_constraint -> constraint.type		= ptype;
+	current_constraint -> constraint.line_no	= current_lineno;
+	current_constraint -> constraint.from.fake_addr	= addr_zero;
+	current_constraint -> constraint.from.lbl	= null;
+	CALL resolve_label(current_constraint,lbl_to  ,pt_lbl);
+	current_constraint -> constraint.del	= pdel;
+end; /* make_z_constraint */
+
+
+match_bits : proc(b,p) returns(bit(1));
+	/* returns true if bitstring b matches pattern p */
+	dcl b bit(128);
+	dcl p ptr; /* to a bitpat */
+
+if index(debug,'M')^=0 then
+do; put  edit('match: ',substr(b,1,48)) (a,a); put  skip;
+    put  edit(' m_eq: ',substr(p->bitpat.mask_eq,1,48)) (a,a); put  skip;
+    put  edit(' d_eq: ',substr(p->bitpat.data_eq,1,48)) (a,a); put  skip;
+/*    put  edit(' neq1: ',p->bitpat.mask_neq1) (a,a); put  skip;
+    put  edit(' d_  : ',p->bitpat.data_neq1) (a,a); put  skip;
+    put  edit(' neq2: ',p->bitpat.mask_neq2) (a,a); put  skip;
+    put  edit(' d_  : ',p->bitpat.data_neq2) (a,a); put  skip;
+    put  edit(' neq3: ',p->bitpat.mask_neq3) (a,a); put  skip;
+    put  edit(' d_  : ',p->bitpat.data_neq3) (a,a); put  skip; */
+end;
+	if (b&p->bitpat.mask_eq) ^= p->bitpat.data_eq        then return(false);
+	if p->bitpat.mask_neq1 ^= '0'b then
+	    if (b&p->bitpat.mask_neq1) = p->bitpat.data_neq1 then return(false); 
+	if p->bitpat.mask_neq2 ^= '0'b then
+	    if (b&p->bitpat.mask_neq2) = p->bitpat.data_neq2 then return(false); 
+	if p->bitpat.mask_neq3 ^= '0'b then
+	    if (b&p->bitpat.mask_neq3) = p->bitpat.data_neq3 then return(false); 
+	return(true);
+end; /* match_bits */
+
+
+parse_sc : proc(sc_w);
+	/* parse stylized comment */
+	dcl 1 sc_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 t_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 last_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl i fixed bin(31);
+
+if (index(debug,'P')^=0) then
+do; put  edit(buf) (a); put  skip;
+call putwindow(sc_w,'='); end;
+	do while(sc_w.len>0);
+		call token(sc_w,t_w);
+if (index(debug,'P')^=0) then
+do; call putwindow( t_w,byte(rank('0')+sc_parse_state) ); end;
+		i = token_type(t_w);
+		call ps_action(t_w,i);
+		call ps_nextstate(t_w,i);
+		last_w = t_w;
+	end; /* do while */
+if (index(debug,'P')^=0) then
+do; t_w.start=1; t_w.len=1; call putwindow( t_w,byte(rank('0')+sc_parse_state) ); end;
+	call ps_action(t_w,t_eoln);		/* force eoln at the end */
+	call ps_nextstate(t_w,t_eoln);		/* force eoln at the end */
+if (index(debug,'P')^=0) then
+do; call putwindow( t_w,byte(rank('0')+sc_parse_state) ); end;
+end; /* parse_sc */
+
+
+perform_actions : proc;
+	/* for each action on action_list that matches the current */
+	/* microinstruction, do that action. The array field holds */
+	/* one-origin windows to various bit fields. */
+	dcl (p,q) ptr;
+	dcl n fixed bin(31);
+	dcl exit_actions bit(1);
+
+if index(debug,'A')^=0 then
+do; put  edit('PERFORM_ACTIONS:')(a); put  skip; 
+    put  edit(unspec(action_list))(a); put  skip;
+    put  edit(current_ubits)(a); put  skip; end;
+	has_misc_field = true;
+	has_load_id = false;
+	has_true_label = true;
+	has_false_label = true;
+
+	q = action_list;
+	exit_actions = false;
+	do while( (q^=null) & (^exit_actions) );
+		p = q->cons.car;
+if index(debug,'R')^=0 then
+do; put  edit('try',p->bitpat.action_number)(a,f(4));
+put  skip; end;
+		if match_bits(current_ubits,p) then
+		    do; /* do the matching action */
+			n = p->bitpat.action_number;
+if index(debug,'A')^=0 then
+do; put  edit(' hit ',n)(a,f(4));
+put  skip; end;
+			call u_action(n, exit_actions);
+		    end; /* do the matching action */
+		q = q->cons.cdr;
+	end; /* do while */
+end; /* perform_actions */
+
+
+
+plant_constraints : proc(base_label,base_offset);
+	/* make waiting AT resolve to first label in ALIGNLIST.	*/
+	/* if any constraints are waiting on label p_next_uinst to become */
+	/*  defined, now is the time to fill them in.		*/
+	dcl base_label char(31) var;
+	dcl base_offset fixed bin(31);
+
+	dcl (q,r) ptr;
+
+if index(debug,'C')^=0 then
+PUT  EDIT('Plant_constraints: ') (a);
+
+	q = p_next_uinst -> symtab.waiting_link;
+	do while (q^=null);
+		r = q -> cons.car;
+		/* r now points to some constraint */
+if index(debug,'C')^=0 then
+PUT  EDIT(dump_ptr(r)) (x(1),a);
+		if r -> constraint.from.lbl = p_next_uinst then
+		    do;
+if index(debug,'C')^=0 then
+PUT  EDIT('a') (a);
+			CALL resolve_label(r,lbl_from,base_label);
+			r -> constraint.del = r -> constraint.del - base_offset;
+		    end;
+		if r -> constraint.to.lbl = p_next_uinst then
+		    do;
+if index(debug,'C')^=0 then
+PUT  EDIT('A') (a);
+			CALL resolve_label(r,lbl_to,base_label);
+			r -> constraint.del = r -> constraint.del + base_offset;
+		    end;
+		CALL finish_constraint(r);
+
+		r = q -> cons.cdr;
+		FREE q->cons;
+		q = r;		
+	end; /* do while q */
+	p_next_uinst -> symtab.waiting_link = null;
+if index(debug,'C')^=0 then
+PUT  SKIP;
+end; /* plant_constraints */
+
+
+
+print_with_stack : PROC(s);
+	/* print line s with name stack on far right */
+	DCL s CHAR(255) VAR;
+	DCL temp CHAR(132);
+	DCL t2 CHAR(31) VAR;
+	DCL (i,j,k) FIXED BIN(31);
+
+	IF (at_heading1 | at_heading2 | (name_stack_ptr<=1)) THEN
+	    DO; CALL retab(s); PUT  EDIT(s) (a); PUT  SKIP; END;
+	ELSE
+	    DO;
+		temp = s;	/* blank pads 		  */
+if index(debug,'C')^=0 then
+do; t2 = dump_ptr(current_constraint); temp = t2||s; end;
+		k = 132;	/* next char to overwrite */
+		DO i = 1 TO name_stack_ptr-1;
+			/* put name(i) onto end of line */
+			t2 = name_stack(i);
+			DO j= min(8,length(t2)) TO 1 BY -1;	/* at most 8 chars */
+				substr(temp,k,1) = substr(t2,j,1);
+				k = k-1;
+			END; /* do j */
+			substr(temp,k,1) = ' ';
+			k = k-1;
+		END; /* do i */
+		s = temp;
+		CALL retab(s);
+		PUT  EDIT(s) (a); PUT  SKIP;
+	    END;
+END; /* print_with_stack */
+
+
+process_labels : proc(w);
+	/* extract zero or more labels */
+	/* start with window w, and slowly shrink it as labels are found */
+	/* queue up labels to be defined by next uInst */
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 token_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl name char(31) var;
+	dcl parsing_labels bit(1);
+	dcl p ptr, is_new bit(1);
+
+	parsing_labels = true;
+	do while( (w.len>0) & parsing_labels );
+		parsing_labels = false;
+		call token(w,token_w);
+		if (token_w.len>0) & (starts_name(rank(substr(buf,token_w.start,1)))) then
+		    do;
+			name = get_name(token_w,31);
+			call token(w,token_w);
+			if (token_w.len>0) & (substr(buf,token_w.start,1)=':') then
+			    do; /* have name : */
+				parsing_labels = true;
+if index(debug,'L')^=0 then
+do; put  edit('LABEL: ',name) (a,a);
+    put  skip; end;
+				p = symtable(name,is_new);
+				call enqueue(pending_labels,p);
+			    end;
+		    end;
+	end; /* do while */
+end; /* process_labels */
+
+
+
+process_one_line : proc;
+
+	call decompose_line(buf_window);
+
+	/* only process labels and stylized comments on .bin lines,
+	   i.e., only those with non-empty ucode field */
+	IF ucode_window.len>0 THEN
+	    DO;
+		label_window = text_window;
+		scomment_window = text_window;
+		call process_labels(label_window);	/* do me first */
+		call process_scomments(scomment_window);
+		call process_ucode(ucode_window);	/* do me last */
+	    END;
+	ELSE IF windex(text_window,';=') <= text_window.len THEN
+	    DO;
+		CALL error_msg('Warning: stylized comment ', 'parsed in .NOBIN area.');
+		scomment_window = text_window;
+		call process_scomments(scomment_window);
+	    END;
+
+if index(debug,'K')^=0 then
+	do; CALL print_with_stack(wcont(buf_window)); end; 
+if index(debug,'W')^=0 then
+	do; call putwindow(ucode_window,'u'); call putwindow(text_window,'t'); end;
+end; /* process_one_line */
+
+
+process_scomments : proc(w);
+	/* find and parse stylized comments, if any */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 trash_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 sc_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl (i,j) fixed bin(31);
+
+	/* error check that continuations are on contiguous lines */
+	if sc_parse_state^=ps_init then
+	    do;
+		i = windex(w,';=');
+		if i>w.len then 	/* no stylized comment here */
+		    do;
+			call error_msg('Stylized comment not continued.',
+					' Abandoned.');
+			sc_parse_state = ps_init;
+		    end;
+	    end;
+
+	/* now look for stylized comments in window */
+	do while(w.len>0);
+		i = windex(w,';=');		/* find ;=	 */
+		CALL split(w,i+2,trash_w,w);	/* just after ;= */
+		j = windex(w,';');		/* find ;	 */
+		CALL split(w,j,sc_w,w);		/* just before ; */
+		IF sc_w.len>0 THEN
+		    CALL parse_sc(sc_w);
+	end; /* do while */
+end; /* process_scomments */
+
+
+process_ucode : proc(w);
+	/* extract the microcode address and bitstring, if any	*/
+	/* the address consists of a single-letter memory name,	*/
+	/* plus an integer (hex) address.			*/
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 local_w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	if (w.len>0) & (wchar(w)^=' ') then
+	    do; /* non-blank ucode */
+		/* set current_umem, _uaddr, _ubits */
+		local_w = w;			/* gets updated */
+		current_umem  = charval(local_w);
+		IF current_umem=allocated_memory THEN
+		    DO; /* only do selected memory, not any others */
+			this_instr_has_z_constr = false;
+			current_uaddr = hexval(local_w);
+			current_ubits = hexbits(local_w);
+			CALL put_adr(current_uaddr, current_lineno, current_page);
+			CALL backpatch_ucode;		/* pending labels, constr  */
+			CALL stacked_constraints;	/* begin/end constr */
+			IF ^this_is_lit THEN
+				CALL perform_actions;	/* automatic branch constr */
+			ELSE
+				this_is_lit = false;	/* skip branch constr exactly once */
+		    END;
+	    end; /* non-blank ucode */
+end; /* process_ucode */
+
+
+
+get_file_and_debug: PROCEDURE(file_name);
+%INCLUDE $stsdef;
+DECLARE file_name CHAR(80) VAR;
+DECLARE lib$get_foreign EXTERNAL ENTRY(CHAR(*)) OPTIONS(VARIABLE) RETURNS(FIXED BINARY(31));
+DECLARE (input_buffer) CHARACTER(132);
+DECLARE (point_start,buff_start,point_end) FIXED BINARY(31);
+
+
+input_buffer=' ';
+
+sts$value=lib$get_foreign(input_buffer);
+
+input_buffer = TRANSLATE(input_buffer,to_upper,from_lower);
+
+point_start=VERIFY(input_buffer,' ');
+
+IF point_start^= 0 THEN DO;
+	point_end = INDEX(SUBSTR(INPUT_BUFFER,POINT_START,132-POINT_START),' ');
+	file_name=SUBSTR(INPUT_BUFFER,POINT_START,POINT_END-POINT_START);
+
+	buff_start=INDEX(INPUT_BUFFER,'/DEBUG=');
+	IF BUFF_START=0 THEN 
+		debug = ' ';
+	ELSE 
+		
+		debug = SUBSTR(INPUT_BUFFER,BUFF_START+7,INDEX(SUBSTR(INPUT_BUFFER,BUFF_START+7,132-BUFF_START-7),' ')-1);
+
+	END;
+
+ELSE DO;
+	PUT SKIP LIST('INPUT FILE NAMES: ');
+	GET LIST(file_name);
+
+
+	/* ---------- OPTIONS ------------------------------------------------------- */
+	put skip edit('A(ctions tR(y E(of W(indow X(hex T(okens N(ocase Z(next I(ncr') (a);
+	put skip edit('C(onstraints L(abels S(ymtab M(atch V(erify P(arse stacK( O(utconstr') (a);
+
+	PUT SKIP EDIT('Debugging options: ') (A);
+	GET LIST(debug);
+	END;
+
+END get_file_and_debug;
+
+
+
+prologue : proc;
+dcl i fixed bin(31);
+dcl random_bit bit(1);
+dcl dt char(6); dcl tt char(8);
+dcl months(1:12) char(3) static readonly initial(
+	'Jan','Feb','Mar','Apr','May','Jun',
+	'Jul','Aug','Sep','Oct','Nov','Dec');
+
+put skip list ('RIGEL ADDRESS ALLOCATOR, PASS 1. '||compile_date);
+from_lower	= 'abcdefghijklmnopqrstuvwxyz';
+to_upper	= 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+CALL get_file_and_debug(inname);
+adrname = inname||'.ADR';
+conname = inname||'.CON';
+extname = inname||'.EXT';
+inname  = inname||'.MCR';
+
+open file(infile) record input title(inname);
+open file(adrfile) stream output title(adrname);
+open file(confile) stream output title(conname);
+open file(extfile) stream output title(extname);
+
+debug = translate(debug,to_upper,from_lower);
+put skip list(debug);
+put  edit('Debug = ',debug)(a,a); put  skip;
+
+unused_buf_window.start = 1;
+unused_buf_window.len = 0;
+
+tab = byte(9);
+ff = byte(12);
+
+dt = date();
+current_date = substr(dt,5,2)       || '-' ||
+	months(bin(substr(dt,3,2))) || '-' ||
+	substr(dt,1,2);
+tt = time();
+current_time = substr(tt,1,2) || ':' ||
+	substr(tt,3,2)        || ':' ||
+	substr(tt,5,2);
+put skip;
+put  edit('Current date: ',current_date,current_time) (a,x(1),a,x(1),a);
+put  skip;
+no_time_stamp = true;
+
+do i = 0 to 1023; hash_anchor(i) = null; end;
+
+this_is_lit = false;
+pending_labels = null;
+pending_constraints = null;
+action_list = null;
+do i=0 to 99; field(i).start = 1; field(i).len = 0; end;
+
+do i=0 to 255; is_decchar(i)='0'b; end;
+do i=rank('0') to rank('9'); is_decchar(i)='1'b; end;
+
+do i=0 to 255; is_hexchar(i) = false; hextable(i) = 0; end;
+do i=rank('0') to rank('9'); is_hexchar(i) = true; hextable(i) = i - rank('0'); end;
+do i=rank('A') to rank('F'); is_hexchar(i) = true; hextable(i) = 10 + i - rank('A'); end;
+do i=rank('a') to rank('f'); is_hexchar(i) = true; hextable(i) = 10 + i - rank('a'); end;
+
+bittable(0)='0000'b; bittable(1)='0001'b; bittable(2)='0010'b; bittable(3)='0011'b;
+bittable(4)='0100'b; bittable(5)='0101'b; bittable(6)='0110'b; bittable(7)='0111'b;
+bittable(8) ='1000'b; bittable(9) ='1001'b; bittable(10)='1010'b; bittable(11)='1011'b;
+bittable(12)='1100'b; bittable(13)='1101'b; bittable(14)='1110'b; bittable(15)='1111'b;
+
+starts_name_str	= from_lower || to_upper || '%$*';
+starts_numb_str	= '0123456789';
+starts_name_or_numb_str	= starts_name_str || starts_numb_str;
+in_name_str	= starts_name_or_numb_str || '._';
+
+do i=0 to 255; starts_name(i) = false; starts_name_or_numb(i) = false;
+    in_name(i) = false; end;
+do i=1 to length(starts_name_str);
+    starts_name(rank(substr(starts_name_str,i,1))) = true; end;
+do i=1 to length(starts_name_or_numb_str);
+    starts_name_or_numb(rank(substr(starts_name_or_numb_str,i,1))) = true; end;
+do i=1 to length(in_name_str);
+    in_name(rank(substr(in_name_str,i,1))) = true; end;
+
+do i=0 to 255; token_type_tbl(i) = t_other; end;
+do i=1 to length(starts_name_str);
+    token_type_tbl(rank(substr(starts_name_str,i,1))) = t_name; end;
+do i=1 to length(starts_numb_str);
+    token_type_tbl(rank(substr(starts_numb_str,i,1))) = t_numb; end;
+token_type_tbl(rank('(')) = t_lpar;
+token_type_tbl(rank(')')) = t_rpar;
+token_type_tbl(rank('+')) = t_plusm;
+token_type_tbl(rank('-')) = t_plusm;
+token_type_tbl(rank(',')) = t_comma;
+/* t_eoln handled in proc token_type */
+
+name_stack(0) = '_TOP_';
+line_stack(0) = 0;
+constraint_stack(0) = null;
+name_stack_ptr = 1;	/* first unused location */
+constraint_count = 0;
+
+sc_parse_state = ps_init;
+current_constraint = null;
+p_next_uinst = symtable(next_uinst,random_bit);
+
+call read_pattern_file;
+
+end; /* prologue */
+
+
+ps_action : proc(t_w,sc_token_type);
+	/* stylized comment parsing action */
+	dcl 1 t_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl sc_token_type fixed bin(31);
+	dcl act fixed bin(31);
+	dcl s char(31) var;
+	dcl 1 localt_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl k fixed bin(31);
+
+	localt_w = t_w;
+	act = sc_action_tbl(sc_parse_state,sc_token_type);
+	GOTO lbl(act);
+
+lbl(ac_nothing): ;
+lbl(ac_init): ;
+lbl(ac_at): ;		/**/
+lbl(ac_region): ;
+lbl(ac_align): ;
+lbl(ac_atlbl): ;	/**/
+lbl(ac_atlblpm): ;	/**/
+lbl(ac_rlbl1): ;
+lbl(ac_rdone1): ;
+lbl(ac_rlbl1pm): ;
+lbl(ac_rlbl2pm): ;
+lbl(ac_align2): ;
+lbl(ac_alblpm): ;
+lbl(ac_aexpr): ;
+lbl(ac_tf): ;
+lbl(ac_pm): ;
+lbl(ac_tail): ;
+lbl(ac_atnumb0): ;
+lbl(ac_atnumb1): ;
+lbl(ac_xxxx): ;
+	RETURN;
+
+lbl(ac_begin):
+	s = wcont(t_w);
+	name_stack(name_stack_ptr) = s;
+	line_stack(name_stack_ptr) = current_lineno;
+	/* stack list of pending constraints */
+	CALL stack_constraints(name_stack_ptr);
+	IF name_stack_ptr<15 THEN
+	    name_stack_ptr = name_stack_ptr + 1;
+	ELSE
+	    CALL error_msg('Too many BEGINs: ',s);
+	RETURN;
+
+lbl(ac_end):
+	s = wcont(t_w);
+	IF name_stack(name_stack_ptr-1)^=s THEN
+	    CALL error_msg( 'END does not match BEGIN at ',
+		char(dec(line_stack(name_stack_ptr-1),5)) ||' '|| 
+		name_stack(name_stack_ptr-1) );
+	IF name_stack_ptr>1 THEN
+	    name_stack_ptr = name_stack_ptr - 1;
+	ELSE
+	    CALL error_msg('Too many ENDs: ',s);
+	CALL unstack_constraints(name_stack_ptr);
+	RETURN;
+
+lbl(ac_rlbl):	/* AT	  label  ...	*/
+		/* REGION label1 ...	*/
+	CALL make_constraint('D',wcont(t_w),next_uinst,0);
+	RETURN;
+
+lbl(ac_rnumb):	/* AT	  03E5  ...	*/
+		/* REGION 03E5  ...	*/
+	k = hexval(localt_w);
+	CALL make_z_constraint('D',next_uinst,k);
+	RETURN;
+
+lbl(ac_setlast):/* AT     label  + ...	*/
+		/* REGION label1 - ...	*/
+	last_token = wcont(t_w);
+	RETURN;
+
+lbl(ac_ulohi):	/* AT     label  - 03E5 */
+	k = hexval(localt_w);
+	IF last_token='-' THEN k = -k;
+	last_token = '';
+	CALL update_del(k);
+	RETURN;
+
+lbl(ac_ulo):	/* REGION label1 - 03E5 ... */
+	k = hexval(localt_w);
+	IF last_token='-' THEN k = -k;
+	last_token = '';
+	CALL update_del(k);
+	RETURN;
+
+lbl(ac_uhi):	/* REGION 03E5 03Ef */
+		/* REGION label1-10 label1+5 */
+	k = hexval(localt_w);
+	IF last_token='-' THEN k = -k;
+	last_token = '';
+	CALL update_del(k);
+	RETURN;
+
+lbl(ac_rlbl2):	/* REGION label1-12 label2 ... */
+	IF ^label_eq(wcont(t_w)) THEN
+		CALL error_msg('Label1 ^= Label2: ',wcont(t_w));
+	RETURN;
+
+lbl(ac_align1):	/* ALIGNLIST 0*10 ... */
+	first_label = true;
+	align_counter = 0;
+	CALL trival(wcont(t_w),alignval,countval);
+	RETURN;
+
+lbl(ac_albl):	/* ALIGNLIST 0*10 ( , lbl1, lbl2, lbl3 ... */
+	if first_label then
+	    do;
+		first_label = false;
+		CALL make_z_constraint('A',wcont(t_w),alignval);
+		base_label = wcont(t_w);
+		base_offset = align_counter;
+		/* resolve pending AT to this label and offset */
+		CALL plant_constraints(base_label,base_offset);
+	    end;
+	else
+	    do;
+		k = align_counter - base_offset;
+		CALL make_constraint('D',base_label,wcont(t_w),k);
+	    end;
+	RETURN;
+
+lbl(ac_incr):	/* ALIGNLIST 0*10 ( , lbl1, lbl2, lbl3 , ... */
+	CALL incr_align_counter;
+	RETURN;
+
+lbl(ac_flush):
+	IF current_constraint^=null THEN
+		CALL finish_constraint(current_constraint);
+	RETURN;
+
+lbl(ac_error):
+	CALL error_msg(';= Syntax Error: ',wcont(t_w));
+	RETURN;
+
+end; /* ps_action */
+
+
+ps_nextstate : proc(t_w,sc_token_type);
+	/* stylized comment parsing nextstate */
+	dcl 1 t_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl sc_token_type fixed bin(31);
+	dcl temp_name char(31) var;
+
+if (index(debug,'Z')^=0) then
+do; put  edit('Next: ',sc_parse_state,sc_token_type) (a,f(4),f(4)); end;
+	if (sc_parse_state=ps_init) & (sc_token_type=t_name) then
+	    do;
+		temp_name = translate(wcont(t_w),to_upper,from_lower);
+if (index(debug,'Z')^=0) then
+do; put  edit(' name: "',temp_name,'"') (a,a,a); end;
+		if      temp_name='AT'     then sc_parse_state = ps_at;
+		else if temp_name='BEGIN'  then sc_parse_state = ps_begin;
+		else if temp_name='END'    then sc_parse_state = ps_end;
+		else if temp_name='REGION' then sc_parse_state = ps_region;
+		else if temp_name='ALIGNLIST' then sc_parse_state = ps_align;
+		else if temp_name='ASSERT' then sc_parse_state = ps_eatit; /* swallow rest quietly */
+		else if temp_name='ODD_PARITY' then sc_parse_state = ps_eatit; /* swallow rest quietly */
+		else if temp_name='EVEN_PARITY' then sc_parse_state = ps_eatit; /* swallow rest quietly */
+		else if temp_name='LITERAL' then 
+			DO; this_is_lit = true; sc_parse_state = ps_eatit; END;/* swallow rest quietly */
+		else if temp_name='T'      then sc_parse_state = ps_tf;
+		else if temp_name='TT'     then sc_parse_state = ps_tf;
+		else if temp_name='F'      then sc_parse_state = ps_tf;
+		else if temp_name='FF'     then sc_parse_state = ps_tf;
+		else
+		    DO;
+						sc_parse_state = ps_error;
+						CALL error_msg(';= Unrecognized keyword: ',
+							temp_name);
+		    END;
+	    end;
+	else
+	    sc_parse_state = sc_next_state_tbl(sc_parse_state,sc_token_type);
+if (index(debug,'Z')^=0) then
+do; put  edit(' Next: ',sc_parse_state) (a,f(4)); put  skip; end;
+end; /* ps_nextstate */
+
+
+put_adr : proc(current_uaddr,current_lineno,current_page);
+	/* print .ADR line */
+	dcl (current_uaddr,current_lineno,current_page) fixed bin(31);
+	put file(adrfile) edit(current_uaddr, current_lineno, current_page)
+			(f(6),f(6),f(6));
+	put file(adrfile) skip;
+end; /* put_adr */
+
+
+put_con : proc(type,lineno,from,to,del);
+	/* print .CON line */
+	dcl type char(1);
+	dcl (lineno,from,to,del) fixed bin(31);
+
+	constraint_count = constraint_count + 1;
+	put file(confile) edit (type,lineno,from,to,del)
+		(a,f(7),f(7),f(7),f(7));
+	put file(confile) skip;
+	IF type='D' & from=addr_zero THEN
+	    this_instr_has_z_constr = true;	/* at least one absolute constraint */
+if index(debug,'O')^=0 then
+do;	put  edit (type,lineno,from,to,del)
+		(a,f(7),f(7),f(7),f(7));
+	put  skip; end;
+end; /* put_con */
+
+
+put_ext : proc(fake_addr,name);
+	/* print .EXT line */
+/*
+This is example of expected .EXT file.  
+Address leading zero can be blanks if you wish...jim\
+; 29-JUN-82 09:05:35
+;= GBL 0000 HARDWARE..
+;= GBL 0001 RSRV.ADDR.FLT..
+;= EXT 0003 JUNK..START
+;= EXT 0004 JUNK__END
+*/
+	dcl fake_addr fixed bin(31);
+	dcl name char(31) var;
+	DCL type CHAR(4);
+
+	IF (SUBSTR(name,LENGTH(name),1)='.')
+		| (SUBSTR(name,LENGTH(name),1)='_') THEN type = 'GBL ';
+						    ELSE type = 'EXT ';
+	put file(extfile) edit(';= ', type, to_hex(fake_addr), ' ', name)
+		(A,A,A,A,A);
+	put file(extfile) skip;
+end; /* put_ext */
+
+
+putwindow : proc (w,c);
+	/* show the window on  */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl c char(1);
+	dcl i fixed bin(31);
+
+	do i=1 to w.start-1;
+	    put  edit(' ') (a);
+	end;
+	do i=1 to w.len;
+	    put  edit(c) (a);
+	end;
+	put  skip;
+end; /* putwindow */
+
+
+read_next_line : proc returns(bit(1));
+	/* supply the next input line, if any, all broken up */
+	/* return true if no more input */
+	/* this routine solves the problem of <FF> embedded in lines */
+
+	dcl i fixed bin(31);
+
+	if unused_buf_window.len=0 then
+	    do; /* refill buffer */
+if index(debug,'E')^=0 then
+do; put  edit('READ_NEXT: eof=',eof) (a,b);
+    put  skip; end;
+		on endfile(infile) eof = true;
+		if ^eof then
+			read file(infile) into(buf);
+		else 
+			return (true);
+if index(debug,'E')^=0 then
+do; put  edit('READ_NEXT: eof=',eof) (a,b);
+    put  skip; end;
+		call untab(buf);
+		buf_window.start = 1;
+		buf_window.len   = length(buf);
+	    end; /* refill buffer */
+	else
+	    do; /* something left from last read */
+		buf_window.start = unused_buf_window.start;
+		buf_window.len   = unused_buf_window.len;
+	    end; /* something left from last read */
+
+	i = index(substr(buf,buf_window.start,buf_window.len),ff);
+	if i<=1 then		/* no embedded FF */
+		i = buf_window.len+1;
+	call split(buf_window,i,buf_window,unused_buf_window);
+	return(false);
+
+end; /* read_next_line */
+
+
+read_pattern_file : proc;
+	/* read patteerns in from a file */
+	dcl i fixed bin(31);
+	dcl xinfile file;
+
+	open file(xinfile) title('RALLOC1$PAT') record input;
+	on endfile(xinfile) goto eof_label;
+	read file(xinfile) into(buf);
+
+	do while (buf^='/');
+		p = extract_pattern(buf);
+		if p^=null then
+		    do;
+			i = p->bitpat.action_number;
+			if i < 100 then
+				call find_field(p,field(i));
+			else
+				call enqueue(action_list,p);	/* build backwards list */
+		    end;
+		read file(xinfile) into(buf);
+	end; /* do */
+eof_label:
+	put skip;
+	close file(xinfile);
+	call reverse(action_list);
+end; /* read_pattern_file */
+
+
+resolve_label : proc(r,tf,s);
+	/* if label s is known, put fake_addr in constraint r, 	*/
+	/* otherwise, queue up r to be resolved later.		*/
+	dcl r ptr;
+	dcl tf fixed bin(31);
+	dcl s char(31) var;
+	dcl p ptr;
+	dcl is_new bit(1);
+
+	p = symtable(s,is_new);
+
+if index(debug,'C')^=0 then
+do; PUT  EDIT('Resolve_label: ',s) (a,a);
+if p->symtab.fake_addr=unknown then
+	PUT  EDIT(' Make constraint wait: ',dump_ptr(r))
+		(a,a);
+else
+	PUT  EDIT(' to ', p->symtab.fake_addr) (a,f(6));
+PUT  SKIP; end;
+
+	IF p -> symtab.fake_addr = unknown THEN
+	    do; /* queue for later */
+		CALL enqueue(p -> symtab.waiting_link, r);
+		IF tf=lbl_from THEN
+		    do;
+			r -> constraint.from.fake_addr = 0;
+			r -> constraint.from.lbl = p;
+		    end;
+		ELSE
+		    do;
+			r -> constraint.to.fake_addr = 0;
+			r -> constraint.to.lbl = p;
+		    end;
+
+	    end; /* queue for later */
+	ELSE
+	    do; /* resolve now */
+		IF tf=lbl_from THEN
+		    do;
+			r -> constraint.from.fake_addr =
+				p -> symtab.fake_addr;
+			r -> constraint.from.lbl = null;
+		    end;
+		ELSE
+		    do;
+			r -> constraint.to.fake_addr =
+				p -> symtab.fake_addr;
+			r -> constraint.to.lbl = null;
+		    end;
+	    end; /* resolve now */
+
+end; /* resolve_label */
+
+
+retab : proc(s);
+	/* Replaces blanks in string s with tabs. Tab = cols 8n+1. */
+	/* Also removes trailing blanks. */
+	dcl s char(255) var;
+	dcl (i,j,k,l,m,mlen) fixed bin(31);
+
+	%replace min_tab by 0;
+
+floor8 : proc(i) returns(fixed bin(31));
+	/* floor k*8+1 */
+	dcl i fixed bin(31);
+	return(divide(i-1,8,31,0)*8+1);	/* 8->1, 9->9, 10->9 */
+end; /* floor8 */
+
+ceil8 : proc(i) returns(fixed bin(31));
+	/* ceil k*8+1 */
+	dcl i fixed bin(31);
+	return(divide(i+6,8,31,0)*8+1);	/* 8->9, 9->9, 10->17 */
+end; /* ceil8 */
+
+/*
+		MIN_TAB
+	don't tab|	   m = 8*k+1	       i
+	/-------\|	   |		       |	
+	-----------------------------------------
+    s:	|part not retabbed| part retabbed	|
+	-----------------------------------------
+			<---- algorithm moves this way.
+*/
+
+
+	l = length(s);
+	do while( (l>0) & (substr(s,l,1)=' ') ); l = l-1; end;	/* trailing blanks */
+	mlen = l - floor8(l) + 1;			/* length of retabbed part */
+	do m = floor8(l) to ceil8(min_tab)+8 by -8;
+		/* decide whether to tab for [m-8..m-1] */
+		j = m-9;
+		do i = m-8 to m-1; if substr(s,i,1)^=' ' then j=i; end;
+		/* j is last non-blank in that interval */
+		if (m-j-1)>=2 then /* at least two blanks -- tab */
+		    do;
+			substr(s,j+1,1) = tab;
+			substr(s,j+2,mlen) = substr(s,m,mlen);
+			mlen = mlen - (m-j-1) + 1;	/* out m-j-1 blanks, in 1 tab */
+		    end;
+		mlen = mlen + 8;
+	end; /* do m */
+	s = substr(s,1,mlen);
+end; /* retab */
+
+
+reverse : proc(anch);
+	/* reverse single-linked cdr list */
+	dcl anch ptr;
+	dcl (p,q,r) ptr;
+
+	q = null;
+	p = anch;
+	do while(p^=null);
+		r = p;			/* r = elem to change    */
+		p = p->cons.cdr;	/* p = unchanged sublist */
+		r->cons.cdr = q;	/* q = reversed sublist  */
+		q = r;
+	end;
+	anch = q;
+end; /* reverse */
+
+
+skip_blanks : proc(w);
+	/* skip over leading blanks. UPDATE w			*/
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 trash_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl i fixed bin(31);
+
+	i = verify(substr(buf,w.start,w.len), ' ');
+	if i=0 then i = w.len+1;
+	call split(w,i,trash_w,w);
+if index(debug,'T')^=0 then
+do; put  edit('after SKIP_BLANKS: "',substr(buf,w.start,w.len),'"')
+    (a,a,a); put  skip; end;
+end; /* skip_blanks */
+
+
+
+split : proc(in_w,k,left_w,right_w);
+	/* split the incoming window into two pieces, 1..k-1, and k..len */
+	/* works in all degenerate cases */
+	dcl 1 in_w,    2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 left_w,  2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 right_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl k fixed bin(31);
+	dcl 1 local_w,    2 start fixed bin(31), 2 len fixed bin(31);
+	dcl local_k fixed bin(31);
+
+	local_w = in_w;
+	local_k = k;
+	if local_k<1 then local_k = 1;			/* make out of bounds */
+	if in_w.len<local_k then local_k = in_w.len+1;	/*  work.	      */
+
+	right_w.start = local_w.start+(local_k-1);
+	right_w.len   = local_w.len-(local_k-1);
+	left_w.start = local_w.start;
+	left_w.len   = local_k-1;
+end; /* split */
+
+
+stack_constraints : proc(i);
+	/* save all pending constraints to apply to each uinst in the block */
+	dcl i fixed bin(31);
+	dcl (q,r) ptr;
+
+if index(debug,'C')^=0 then
+PUT  EDIT('stack_constraints: ') (a);
+
+	constraint_stack(i) = null;
+	q = p_next_uinst -> symtab.waiting_link;
+	do while (q^=null);
+		r = q -> cons.car;
+		/* r now points to some constraint */
+if index(debug,'C')^=0 then
+PUT  EDIT(dump_ptr(r)) (x(1),a);
+		/* can only stack absolute region constraints */
+		IF (r -> constraint.type^='D') |
+		   (r -> constraint.from.fake_addr^=addr_zero) |
+		   (r -> constraint.from.lbl^=null) |
+		   (r -> constraint.to.lbl^=p_next_uinst) THEN
+			CALL error_msg('Can''t stack constraint ',
+				char(dec(r->constraint.line_no),5));
+		ELSE
+			CALL enqueue(constraint_stack(i),r);
+
+		r = q -> cons.cdr;
+		FREE q->cons;
+		q = r;		
+	end; /* do while q */
+	p_next_uinst -> symtab.waiting_link = null;
+if index(debug,'C')^=0 then
+PUT  SKIP;
+
+end; /* stack_constraints */
+
+
+stacked_constraints : proc;
+	/* apply all pending constraints to current uinst */
+	dcl i fixed bin(31);
+	dcl (q,r) ptr;
+
+if index(debug,'C')^=0 then
+PUT  EDIT('stacked_constraints: ') (a);
+
+	do i=name_stack_ptr-1 to 1 by -1;
+		q = constraint_stack(i);
+		do while (q^=null);
+			r = q -> cons.car;
+			/* r now points to some constraint */
+if index(debug,'C')^=0 then
+PUT  EDIT(dump_ptr(r)) (x(1),a);
+			IF ^this_instr_has_z_constr THEN
+			/* don't use stacked constraint if some absolute 
+			   constraint (z_constr) has already been 
+			   generated for this instruction. Intention 
+			   here is to allow something like AT 400 inside 
+			   a REGION 1000 1FFF BEGIN-END block. */
+								
+			CALL put_con(r -> constraint.type,
+	 			     r -> constraint.line_no,
+				     r -> constraint.from.fake_addr,
+				     current_uaddr,
+				     r -> constraint.del
+				);
+			q = q -> cons.cdr;
+		end; /* do while q */
+	end; /* do i */
+if index(debug,'C')^=0 then
+PUT  SKIP;
+
+end; /* stacked_constraints */
+
+
+symtable : proc(n,is_new) returns(ptr);
+	/* looks up name n in symtab. if not found, inserts it. */
+	/* returns is_new=true if inserted */
+	dcl n char(31) var;
+	dcl is_new bit(1);
+	dcl i fixed bin(31), p ptr;
+
+	i = hashval(n);
+	p = hash_anchor(i);
+	do while( (p^=null) & (p->symtab.name^=n) );
+		p = p->hash_link; end;
+	is_new = (p=null);
+	if p=null then
+	    do; /* insert new entry */
+		allocate symtab set(p);
+		p->symtab.hash_link	= hash_anchor(i);
+		p->symtab.name		= n;
+		p->symtab.fake_addr	= unknown;
+		p->symtab.line_no	= current_lineno;
+		p->symtab.waiting_link	= null;
+		hash_anchor(i) = p;
+	    end; /* insert new entry */
+	return(p);
+end; /* symtab */
+
+
+trival : proc(s,alignval,countval);
+	dcl s char(31) var;
+	dcl (alignval,countval) fixed bin(31);
+	dcl i fixed bin(31);
+	dcl c char(1);
+
+	alignval = 0;  countval = 0;
+	do i=1 to length(s);
+		c = substr(s,i,1);
+		if c='*' then
+			do; alignval = alignval*3 + 0; countval = countval*2 + 1; end;
+		else if c='0' then
+			do; alignval = alignval*3 + 1; countval = countval*2 + 0; end;
+		else if c='1' then
+			do; alignval = alignval*3 + 2; countval = countval*2 + 1; end;
+		else
+			CALL error_msg('Align-expr not *01 : ',s);
+	end;	
+	IF alignval=0 THEN	/* pattern is "*": count by ones */
+		countval = 0;
+end; /* trival */
+
+
+to_hex : PROC (i) RETURNS(CHAR(4));
+	/* Convert integer to 4-character hex */
+	DCL i FIXED BIN(31);
+	DCL (k,temp) FIXED BIN(31);
+	DCL c4 CHAR(4);
+
+	temp = i;	/* only works for non-negative integers */
+	DO k = 4 TO 1 BY -1;
+		SUBSTR(c4,k,1) = SUBSTR('0123456789ABCDEF',MOD(temp,16)+1,1);
+		temp = DIVIDE(temp,16,31,0);
+	END;
+	RETURN(c4);
+END to_hex;
+
+
+token : proc(w,t_w);
+	/* extract the next token from w. UPDATE w.			*/
+	/* return t_w enclosing the token.				*/
+	/* a token is:
+		a name, containing A-Z,a-z,0-9, "._%$*", or
+		a number(hex), containing 0-9,a-z,A-Z, or
+		an alignlist, containing 01*, or
+		a SINGLE punctuation character				*/
+	/* leading blanks are ignored					*/
+
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl 1 t_w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl i fixed bin(31);
+
+if index(debug,'T')^=0 then
+do; put  edit('before TOKEN: "',substr(buf,w.start,w.len),'"')
+(a,a,a); put  skip; end;
+	call skip_blanks(w);
+	if (w.len>0) then
+	    do;
+		if starts_name_or_numb(rank(wchar(w))) then
+		    do;	/* name or number */
+			i = wverify(w,in_name_str);	/* to first non-name char */
+			call split(w,i,t_w,w);		/* pull out word */
+		    end;
+		else
+		    do;
+			call split(w,2,t_w,w);		/* pull out one char */
+		    end;
+	    end;
+	else
+	    t_w = w;	/* both empty */
+if index(debug,'T')^=0 then
+do; put  edit('after TOKEN: "',substr(buf,w.start,w.len),'"')
+(a,a,a); put  skip; end;
+end; /* token */
+
+
+token_type : proc(w) returns(fixed bin(31));
+	/* map token in w to small integer */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	if w.len>0 then
+	    return( token_type_tbl(rank(wchar(w))) );
+	else;
+	    return( t_eoln );
+end; /* token_type */
+
+
+u_action : proc(n, exit_actions);
+	/* do action number n */
+	dcl n fixed bin(31);
+	dcl exit_actions bit(1);
+	dcl t bit(128);
+	dcl (from,to,align) fixed bin(31);
+	DCL (alignval,countval) FIXED BIN(31);
+
+	exit_actions = false;
+
+	IF (100<=n) & (n<=104) THEN
+		GOTO l(n);
+
+l(101):	DO;	/* CASE branch to destination in the same page */
+		/* emit B . F 128  */
+		from = current_uaddr;
+		to = bin( substr(current_ubits,
+			field(3).start,
+			field(3).len) );	/* false field */
+		CALL put_con('B', current_lineno, from, to, 128);
+		RETURN;
+	END;
+
+l(102):	DO;	/* CALL - Constrain return point */
+		/* emit D . F 1  */
+		from = current_uaddr;
+		to = bin( substr(current_ubits,
+			field(3).start,
+			field(3).len) );	/* false field */
+/* --------> TEMP RLS 28-NOV-84: current+1= uPC+1 <-------- */
+		CALL put_con('D', current_lineno, from, from+1, CALL_DELTA+1);
+		RETURN;
+	END;
+
+l(100): ;
+l(103): ;
+l(104): ;
+	RETURN;
+
+end; /* u_action */
+
+
+unstack_constraints : proc(i);
+	/* pop all pending constraints to apply to each uinst in the block */
+	dcl i fixed bin(31);
+	dcl (q,r) ptr;
+
+if index(debug,'C')^=0 then
+PUT  EDIT('unstack_constraints: ') (a);
+
+	q = constraint_stack(i);
+	do while (q^=null);
+		r = q -> cons.car;
+		/* r now points to some constraint */
+if index(debug,'C')^=0 then
+PUT  EDIT(dump_ptr(r)) (x(1),a);
+		FREE r -> constraint;
+		r = q -> cons.cdr;
+		FREE q->cons;
+		q = r;		
+	end; /* do while q */
+	constraint_stack(i) = null;
+if index(debug,'C')^=0 then
+PUT  SKIP;
+end; /* unstack_constraints */
+
+
+untab : proc(s);
+	/* Replaces tabs in string s with blanks. Tab = cols 8n+1 */
+	dcl s char(255) var;
+	dcl (i,j) fixed bin(31);
+
+	i = index(s,tab);
+	do while (i>0);
+		s = substr(s,1,i-1) ||
+			substr('        ',1,mod(8-i,8)+1) ||
+			substr(s,i+1);
+		i = index(s,tab);
+	end; /* do while */
+end; /* untab */
+
+
+update_del : proc(pdel);
+	dcl pdel fixed bin (31);
+	current_constraint -> constraint.del = pdel;
+end; /* update_del */
+
+
+wchar : proc(w) returns(char(1));
+	/* return first char in window */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	if w.len>0 then return(substr(buf,w.start,1));
+		   else return('?');
+end; /* wchar */
+
+
+wcont : proc(w) returns(char(255)var);
+	/* return contents of window */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+
+	return(substr(buf,w.start,w.len));
+end; /* wcont */
+
+
+windex : proc(w,str) returns(fixed bin(31));
+	/* index string str in window w */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl str char(255) var;
+	dcl i fixed bin(31);
+
+	i = index(wcont(w),str);
+	if i=0 then i = w.len+1;	/* put not found off the tail end */
+	return(i);
+end; /* windex */
+
+
+wverify : proc(w,str) returns(fixed bin(31));
+	/* verify string str in window w */
+	dcl 1 w, 2 start fixed bin(31), 2 len fixed bin(31);
+	dcl str char(255) var;
+	dcl i fixed bin(31);
+
+if (index(debug,'V')^=0) then
+do; put  edit('Verify: ',w.start,w.len) (a,f(4),f(4));
+put  skip;
+put  edit('       "',wcont(w),'"') (a,a,a);
+put  skip;
+put  edit('       "',str,'"') (a,a,a);
+put  skip; end;
+	i = verify(wcont(w),str);
+	if i=0 then i = w.len+1;	/* put not found off the tail end */
+	return(i);
+end; /* wverify */
+
+
+/*************************************/
+/************ main program ***********/
+/*************************************/
+
+/* CALL PME_init; */
+call prologue;
+
+eof = false;
+on endfile(infile) eof = true;
+
+myeof = read_next_line();
+do while (^myeof);
+	call process_one_line;
+	myeof = read_next_line();
+end; /* do while */
+
+PUT SKIP EDIT (constraint_count, ' constraints generated.') (A,A);
+
+call epilogue;
+/* CALL PME_exit; */
+
+end; /* ralloc1 */
+
